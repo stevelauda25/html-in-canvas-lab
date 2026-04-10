@@ -162,6 +162,18 @@ void main() {
 //   Smoothing   easing speed
 //   Mode        attract / repel`,
   },
+  seedgrowth: {
+    kind: "seedgrowth",
+    source: `// Built-in Seed Growth preset.
+// Click to drop seeds. Seeds land on DOM elements and grow
+// organic vine/branch structures via animated SVG paths.
+// Growth wraps around elements and stays attached.
+//
+// Controls:
+//   Growth speed   how fast vines extend
+//   Density        branching complexity
+//   Spread         how far vines reach`,
+  },
 };
 
 const DEFAULT_PRESET = "blur";
@@ -193,6 +205,13 @@ const mgSmoothingEl = $("mg_smoothing");
 const mgSmoothingValueEl = $("mg_smoothing_value");
 const mgModeEl = $("mg_mode");
 const mgModeValueEl = $("mg_mode_value");
+const sgControlsEl = $("seedgrowth_controls");
+const sgGrowthSpeedEl = $("sg_growth_speed");
+const sgGrowthSpeedValueEl = $("sg_growth_speed_value");
+const sgDensityEl = $("sg_density");
+const sgDensityValueEl = $("sg_density_value");
+const sgSpreadEl = $("sg_spread");
+const sgSpreadValueEl = $("sg_spread_value");
 const fbControlsEl = $("fireburn_controls");
 const fbIntensityEl = $("fb_intensity");
 const fbIntensityValueEl = $("fb_intensity_value");
@@ -384,6 +403,7 @@ function syncPresetUi() {
   bhControlsEl.hidden = preset.kind !== "blackhole";
   fbControlsEl.hidden = preset.kind !== "fireburn";
   mgControlsEl.hidden = preset.kind !== "magnetic";
+  sgControlsEl.hidden = preset.kind !== "seedgrowth";
   if (preset.kind === "roll") {
     presetHintEl.innerHTML =
       "Requires <code>chrome://flags/#canvas-draw-element</code>. This preset uses a built-in WebGL mesh pass with live <code>uProgress</code> control.";
@@ -396,6 +416,9 @@ function syncPresetUi() {
   } else if (preset.kind === "magnetic") {
     presetHintEl.innerHTML =
       "Cursor acts as a magnet. Elements are attracted or repelled smoothly. Adjust <code>strength</code>, <code>radius</code>, <code>smoothing</code>, and toggle <code>attract/repel</code> below.";
+  } else if (preset.kind === "seedgrowth") {
+    presetHintEl.innerHTML =
+      "Click to drop seeds. Organic vines grow on elements where seeds land. Adjust <code>growth speed</code>, <code>density</code>, <code>spread</code> below.";
   } else {
     presetHintEl.innerHTML =
       "Requires <code>chrome://flags/#canvas-draw-element</code>. Fragment presets expose <code>uTex</code>, <code>uTime</code>, <code>uResolution</code>, <code>vUv</code>.";
@@ -430,6 +453,14 @@ function getMgValues() {
   };
 }
 
+function getSgValues() {
+  return {
+    sgGrowthSpeed: clamp01(Number(sgGrowthSpeedEl.value)),
+    sgDensity: clamp01(Number(sgDensityEl.value)),
+    sgSpread: clamp01(Number(sgSpreadEl.value)),
+  };
+}
+
 function buildApplyConfig() {
   const preset = getPreset();
   return {
@@ -439,6 +470,7 @@ function buildApplyConfig() {
     ...getBhValues(),
     ...getFbValues(),
     ...getMgValues(),
+    ...getSgValues(),
   };
 }
 
@@ -558,6 +590,30 @@ for (const el of [mgStrengthEl, mgRadiusEl, mgSmoothingEl, mgModeEl]) {
   });
 }
 syncMgLabels();
+
+function syncSgLabels() {
+  sgGrowthSpeedValueEl.textContent = clamp01(Number(sgGrowthSpeedEl.value)).toFixed(2);
+  sgDensityValueEl.textContent = clamp01(Number(sgDensityEl.value)).toFixed(2);
+  sgSpreadValueEl.textContent = clamp01(Number(sgSpreadEl.value)).toFixed(2);
+}
+
+for (const el of [sgGrowthSpeedEl, sgDensityEl, sgSpreadEl]) {
+  el.addEventListener("input", async () => {
+    syncSgLabels();
+    if (
+      getPreset().kind !== "seedgrowth" ||
+      appState.appliedEngine !== "seedgrowth"
+    )
+      return;
+    try {
+      await inject(updateShaderConfigInPage, [getSgValues()]);
+      setStatus("");
+    } catch (e) {
+      setStatus(String(e));
+    }
+  });
+}
+syncSgLabels();
 
 async function inject(func, args = []) {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -2085,6 +2141,513 @@ void main() {
     };
   }
 
+  // ── Seed Growth DOM engine ──────────────────────────────────────
+  // Click to drop seeds. Canvas-based per-element rendering.
+  // Each plant has a fixed root. Wind affects only upper segments.
+  // Growth is segment-by-segment, not scale-based.
+  function createSeedGrowthEngine(config) {
+    const state = {
+      cursorX: 0, cursorY: 0,
+      growthSpeed: clampUnit(Number(config.sgGrowthSpeed ?? 0.5)),
+      density: clampUnit(Number(config.sgDensity ?? 0.5)),
+      spread: clampUnit(Number(config.sgSpread ?? 0.5)),
+    };
+
+    const MAX_GROWTHS = 50; // soft cap — oldest plants are recycled
+    const growths = [];
+
+    // Particle overlay (viewport-fixed, ephemeral)
+    const pDpr = Math.min(window.devicePixelRatio || 1, 2);
+    const particleCanvas = document.createElement("canvas");
+    particleCanvas.id = "__html_shader_sg_particles__";
+    Object.assign(particleCanvas.style, {
+      position: "fixed", inset: "0",
+      width: "100vw", height: "100vh",
+      pointerEvents: "none", zIndex: "2147483647",
+    });
+    particleCanvas.width = Math.floor(innerWidth * pDpr);
+    particleCanvas.height = Math.floor(innerHeight * pDpr);
+    document.body.appendChild(particleCanvas);
+    const pCtx = particleCanvas.getContext("2d");
+    pCtx.scale(pDpr, pDpr);
+
+    const particles = [];
+    const MAX_PARTICLES = 200;
+
+    // Seed bag cursor
+    const cursorEl = document.createElement("div");
+    cursorEl.id = "__html_shader_sg_cursor__";
+    Object.assign(cursorEl.style, {
+      position: "fixed", pointerEvents: "none",
+      zIndex: "2147483647",
+      width: "28px", height: "32px",
+      transform: "translate(-50%, -100%)",
+      filter: "drop-shadow(0 2px 4px rgba(0,0,0,0.3))",
+    });
+    cursorEl.innerHTML = `<svg viewBox="0 0 28 36" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <path d="M6 10 C6 6 10 3 14 3 C18 3 22 6 22 10" stroke="#8B6914" stroke-width="2" fill="none"/>
+      <path d="M4 12 C4 10 6 9 6 9 L22 9 C22 9 24 10 24 12 L23 28 C23 30 21 31 19 31 L9 31 C7 31 5 30 5 28 Z" fill="#C4A24E" stroke="#8B6914" stroke-width="1"/>
+      <circle class="__sg_bobseed" cx="10" cy="18" r="1.5" fill="#5D4E1A"/>
+      <circle class="__sg_bobseed" cx="14" cy="20" r="1.5" fill="#6B5B1F"/>
+      <circle class="__sg_bobseed" cx="18" cy="17" r="1.5" fill="#5D4E1A"/>
+      <circle class="__sg_bobseed" cx="12" cy="23" r="1.3" fill="#6B5B1F"/>
+      <circle class="__sg_bobseed" cx="16" cy="24" r="1.3" fill="#5D4E1A"/>
+      <circle class="__sg_bobseed" cx="9" cy="26" r="1.2" fill="#5D4E1A"/>
+      <circle class="__sg_bobseed" cx="19" cy="25" r="1.2" fill="#6B5B1F"/>
+      <circle class="__sg_bobseed" cx="14" cy="27" r="1.4" fill="#5D4E1A"/>
+    </svg>`;
+    document.body.appendChild(cursorEl);
+    const bobSeeds = cursorEl.querySelectorAll(".__sg_bobseed");
+    const bobBaseCY = Array.from(bobSeeds).map((s) => parseFloat(s.getAttribute("cy")) || 20);
+    let swingPhase = 0;
+    let clickPulse = 0;
+
+    // ── Segment data structure ──
+    // A plant is a tree of segments. Each segment knows its depth
+    // from root (0 = base), its parent, and its children.
+    // Wind displacement scales with depth: root=0, tips=max.
+
+    function generatePlant(rootX, rootY, density, spread) {
+      const segments = [];
+      const leaves = [];
+      const maxDepth = 4 + Math.floor(density * 3);
+      const spreadAngle = 0.4 + spread * 0.8;
+
+      function grow(px, py, angle, len, depth, parentIdx, delay) {
+        if (depth > maxDepth || len < 3) return;
+        const segCount = 2 + Math.floor(Math.random() * 2);
+        let cx = px, cy = py;
+        let curAngle = angle;
+
+        for (let s = 0; s < segCount; s++) {
+          const segLen = len / segCount * (0.8 + Math.random() * 0.4);
+          curAngle += (Math.random() - 0.5) * 0.5;
+          // Gravity bias: tend upward for stems, lateral for branches
+          if (depth === 0) curAngle += ((-Math.PI / 2) - curAngle) * 0.1;
+
+          const nx = cx + Math.cos(curAngle) * segLen;
+          const ny = cy + Math.sin(curAngle) * segLen;
+
+          // Control points for cubic bezier (organic curve)
+          const cp1x = cx + Math.cos(curAngle + 0.3) * segLen * 0.35 + (Math.random() - 0.5) * 4;
+          const cp1y = cy + Math.sin(curAngle + 0.3) * segLen * 0.35 + (Math.random() - 0.5) * 4;
+          const cp2x = nx + Math.cos(curAngle - 0.3) * segLen * -0.25 + (Math.random() - 0.5) * 3;
+          const cp2y = ny + Math.sin(curAngle - 0.3) * segLen * -0.25 + (Math.random() - 0.5) * 3;
+
+          const seg = {
+            x1: cx, y1: cy, x2: nx, y2: ny,
+            cp1x, cp1y, cp2x, cp2y,
+            depth, segIndex: s,
+            totalDepth: depth + s / segCount, // fractional depth for smooth wind
+            thickness: Math.max(0.8, 3.5 - depth * 0.7 - s * 0.2),
+            hue: 85 + Math.random() * 50,
+            sat: 30 + Math.random() * 30,
+            lum: 22 + depth * 5 + Math.random() * 10,
+            opacity: 0.7 + Math.random() * 0.3,
+            delay: delay + s * 0.08,
+            parentIdx,
+          };
+          segments.push(seg);
+          parentIdx = segments.length - 1;
+          cx = nx;
+          cy = ny;
+        }
+
+        // Leaves at tips and mid-branches
+        if (depth >= maxDepth - 2) {
+          const leafCount = 2 + Math.floor(Math.random() * 3);
+          for (let l = 0; l < leafCount; l++) {
+            const la = curAngle + (Math.random() - 0.5) * 1.2;
+            leaves.push({
+              x: cx + Math.cos(la) * (2 + Math.random() * 3),
+              y: cy + Math.sin(la) * (2 + Math.random() * 3),
+              rx: 2.5 + Math.random() * 3.5,
+              ry: 4 + Math.random() * 4,
+              angle: la * (180 / Math.PI) + (Math.random() - 0.5) * 30,
+              hue: 90 + Math.random() * 55,
+              sat: 45 + Math.random() * 35,
+              lum: 30 + Math.random() * 25,
+              opacity: 0.6 + Math.random() * 0.35,
+              depth: depth + 1,
+              delay: delay + segCount * 0.08 + 0.15 + l * 0.05,
+              jitterPhase: Math.random() * Math.PI * 2,
+            });
+          }
+        }
+
+        // Sub-branches (staggered delay) — always branch generously
+        const branchCount = 2 + Math.floor(density * 3);
+        for (let b = 0; b < branchCount; b++) {
+          if (Math.random() > 0.75 + density * 0.2) continue;
+          const splitSeg = Math.floor(Math.random() * segCount);
+          const splitPt = segments[segments.length - segCount + splitSeg];
+          if (!splitPt) continue;
+          const branchAngle = curAngle + (Math.random() - 0.5) * spreadAngle * 2.5;
+          const branchLen = len * (0.35 + Math.random() * 0.3);
+          const branchDelay = delay + splitSeg * 0.08 + 0.1;
+          grow(splitPt.x2, splitPt.y2, branchAngle, branchLen,
+               depth + 1, segments.length - segCount + splitSeg, branchDelay);
+        }
+      }
+
+      // Main stems — lush but compact
+      const stemCount = 2 + Math.floor(density * 2.5);
+      for (let i = 0; i < stemCount; i++) {
+        const angle = -Math.PI / 2 + (Math.random() - 0.5) * spreadAngle;
+        const len = 25 + spread * 40 + Math.random() * 15; // compact: 25-80px
+        grow(rootX, rootY, angle, len, 0, -1, i * 0.06);
+      }
+
+      // Normalize delays so total growth fits within ~1s window
+      let maxDelay = 0;
+      for (const s of segments) maxDelay = Math.max(maxDelay, s.delay);
+      for (const l of leaves) maxDelay = Math.max(maxDelay, l.delay);
+      if (maxDelay > 0) {
+        const targetDuration = 0.7; // raw delay range maps to 0-0.7
+        const scale = targetDuration / maxDelay;
+        for (const s of segments) s.delay *= scale;
+        for (const l of leaves) l.delay *= scale;
+      }
+
+      return { segments, leaves, rootX, rootY };
+    }
+
+    // ── Per-element growth canvas ──
+    function createGrowthCanvas(el) {
+      const rect = el.getBoundingClientRect();
+      const pad = 90; // extra space so plants aren't clipped
+      const canvas = document.createElement("canvas");
+      canvas.className = "__sg_growth_canvas";
+      const w = rect.width + pad * 2;
+      const h = rect.height + pad * 2;
+      canvas.width = Math.ceil(w * pDpr);
+      canvas.height = Math.ceil(h * pDpr);
+      Object.assign(canvas.style, {
+        position: "absolute",
+        top: -pad + "px",
+        left: -pad + "px",
+        width: w + "px",
+        height: h + "px",
+        pointerEvents: "none",
+        zIndex: "1",
+      });
+
+      // Ensure parent allows overflow + positioning
+      const pos = getComputedStyle(el).position;
+      if (pos === "static") el.style.position = "relative";
+      el.style.overflow = "visible";
+      el.appendChild(canvas);
+
+      const ctx = canvas.getContext("2d");
+      ctx.scale(pDpr, pDpr);
+      return { canvas, ctx, pad, w, h };
+    }
+
+    // ── Draw a plant onto its canvas ──
+    function drawPlant(g, windPhase) {
+      const { ctx, pad, w, h, plant } = g;
+      const { segments, leaves, rootY } = plant;
+
+      ctx.save();
+      ctx.setTransform(pDpr, 0, 0, pDpr, 0, 0);
+      ctx.clearRect(0, 0, w, h);
+
+      // Shadow under root
+      ctx.save();
+      ctx.beginPath();
+      ctx.ellipse(plant.rootX + pad, plant.rootY + pad + 2, 8, 2, 0, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(0,0,0,0.12)";
+      ctx.fill();
+      ctx.restore();
+
+      // Max depth for wind scaling
+      let maxTotalDepth = 1;
+      for (const s of segments) maxTotalDepth = Math.max(maxTotalDepth, s.totalDepth + 1);
+
+      // Draw segments
+      for (let i = 0; i < segments.length; i++) {
+        const s = segments[i];
+        // Growth progress for this segment
+        const segProgress = Math.max(0, Math.min((g.progress - s.delay) / 0.2, 1));
+        if (segProgress <= 0) continue;
+        const ep = segProgress * segProgress * (3 - 2 * segProgress); // smoothstep
+
+        // Wind: amplitude scales with depth from root. Root=0, tips=max.
+        const windFactor = s.totalDepth / maxTotalDepth;
+        const windAmp = windFactor * windFactor * 3.5;
+        const windX = Math.sin(windPhase * 1.3 + s.totalDepth * 0.8 + i * 0.3) * windAmp;
+        const windY = Math.cos(windPhase * 1.7 + s.totalDepth * 0.5) * windAmp * 0.3;
+
+        // Offset: root points stay fixed, tips get full wind
+        const startWF = (s.totalDepth > 0.5) ? (s.totalDepth - 0.5) / maxTotalDepth : 0;
+        const endWF = windFactor;
+        const swx1 = windX * startWF * startWF;
+        const swy1 = windY * startWF * startWF;
+        const swx2 = windX * endWF * endWF;
+        const swy2 = windY * endWF * endWF;
+
+        // Interpolate drawn portion (progressive growth)
+        const x1 = s.x1 + pad + swx1;
+        const y1 = s.y1 + pad + swy1;
+        const x2 = s.x1 + (s.x2 - s.x1) * ep + pad + swx2 * ep;
+        const y2 = s.y1 + (s.y2 - s.y1) * ep + pad + swy2 * ep;
+        const cx1 = s.x1 + (s.cp1x - s.x1) * ep + pad + swx1 + (swx2 - swx1) * 0.33;
+        const cy1 = s.y1 + (s.cp1y - s.y1) * ep + pad + swy1 + (swy2 - swy1) * 0.33;
+        const cx2 = s.x1 + (s.cp2x - s.x1) * ep + pad + swx1 + (swx2 - swx1) * 0.66;
+        const cy2 = s.y1 + (s.cp2y - s.y1) * ep + pad + swy1 + (swy2 - swy1) * 0.66;
+
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        ctx.bezierCurveTo(cx1, cy1, cx2, cy2, x2, y2);
+        ctx.strokeStyle = `hsla(${s.hue}, ${s.sat}%, ${s.lum}%, ${s.opacity * ep})`;
+        ctx.lineWidth = s.thickness * (0.5 + ep * 0.5);
+        ctx.lineCap = "round";
+        ctx.stroke();
+      }
+
+      // Draw leaves
+      for (const lf of leaves) {
+        const lfProgress = Math.max(0, Math.min((g.progress - lf.delay) / 0.2, 1));
+        if (lfProgress <= 0) continue;
+        const ep = lfProgress * lfProgress;
+
+        const windFactor = lf.depth / maxTotalDepth;
+        const windAmp = windFactor * windFactor * 4;
+        const wX = Math.sin(windPhase * 1.3 + lf.depth * 0.8 + lf.jitterPhase) * windAmp;
+        const wY = Math.cos(windPhase * 1.7 + lf.depth * 0.5) * windAmp * 0.3;
+        // Micro jitter
+        const jX = Math.sin(windPhase * 5 + lf.jitterPhase * 3) * 0.6;
+        const jY = Math.cos(windPhase * 6 + lf.jitterPhase * 2) * 0.4;
+
+        const lx = lf.x + pad + wX + jX;
+        const ly = lf.y + pad + wY + jY;
+
+        ctx.save();
+        ctx.translate(lx, ly);
+        ctx.rotate((lf.angle + Math.sin(windPhase * 2 + lf.jitterPhase) * 5) * Math.PI / 180);
+        ctx.beginPath();
+        ctx.ellipse(0, 0, lf.rx * ep, lf.ry * ep, 0, 0, Math.PI * 2);
+        ctx.fillStyle = `hsla(${lf.hue}, ${lf.sat}%, ${lf.lum}%, ${lf.opacity * ep})`;
+        ctx.fill();
+        // Leaf vein
+        if (ep > 0.5) {
+          ctx.beginPath();
+          ctx.moveTo(0, -lf.ry * ep * 0.7);
+          ctx.lineTo(0, lf.ry * ep * 0.7);
+          ctx.strokeStyle = `hsla(${lf.hue}, ${lf.sat - 10}%, ${lf.lum - 8}%, ${0.3 * ep})`;
+          ctx.lineWidth = 0.4;
+          ctx.stroke();
+        }
+        ctx.restore();
+      }
+
+      ctx.restore();
+    }
+
+    function spawnPollen(x, y, count) {
+      for (let i = 0; i < count && particles.length < MAX_PARTICLES; i++) {
+        const a = Math.random() * Math.PI * 2;
+        const spd = 5 + Math.random() * 25;
+        const life = 0.8 + Math.random() * 1.5;
+        particles.push({
+          x, y,
+          vx: Math.cos(a) * spd,
+          vy: Math.sin(a) * spd - 5 - Math.random() * 10,
+          life, maxLife: life,
+          size: 1 + Math.random() * 2.5,
+          hue: 50 + Math.random() * 70,
+        });
+      }
+    }
+
+    function createFallingSeed(x, y) {
+      const seed = document.createElement("div");
+      seed.className = "__sg_seed";
+      Object.assign(seed.style, {
+        position: "fixed",
+        left: x + "px", top: y + "px",
+        width: "6px", height: "8px",
+        borderRadius: "50% 50% 50% 50% / 60% 60% 40% 40%",
+        background: "radial-gradient(ellipse at 40% 30%, #8B7332, #5D4E1A)",
+        pointerEvents: "none",
+        zIndex: "2147483646",
+        transform: "translate(-50%, -50%)",
+      });
+      document.body.appendChild(seed);
+      return seed;
+    }
+
+    // Spawn scattered seed particles on click (visual feedback)
+    function spawnSeedScatter(x, y) {
+      for (let i = 0; i < 6; i++) {
+        const a = Math.random() * Math.PI * 2;
+        const spd = 30 + Math.random() * 60;
+        const life = 0.3 + Math.random() * 0.4;
+        particles.push({
+          x: x + (Math.random() - 0.5) * 10,
+          y: y - 5 + (Math.random() - 0.5) * 8,
+          vx: Math.cos(a) * spd,
+          vy: Math.sin(a) * spd - 20,
+          life, maxLife: life,
+          size: 1.5 + Math.random() * 2,
+          hue: 30 + Math.random() * 20, // brown/tan seed color
+        });
+      }
+    }
+
+    function dropSeed(viewX, viewY) {
+      // Recycle oldest plants if at soft cap
+      while (growths.length >= MAX_GROWTHS) {
+        const oldest = growths.shift();
+        if (oldest.canvas.parentNode) oldest.canvas.remove();
+      }
+
+      const elUnder = document.elementFromPoint(viewX, viewY);
+      if (!elUnder || elUnder.closest("[id^='__html_shader']") ||
+          elUnder.classList.contains("__sg_seed") ||
+          elUnder.classList.contains("__sg_growth_canvas")) return;
+
+      // Click feedback: cursor pulse + seed scatter
+      clickPulse = 1.0;
+      spawnSeedScatter(viewX, viewY);
+
+      // Multiple falling seeds for visual richness
+      const seedCount = 2 + Math.floor(Math.random() * 3);
+      for (let s = 0; s < seedCount; s++) {
+        const sx = viewX + (Math.random() - 0.5) * 16;
+        const seed = createFallingSeed(sx, viewY);
+        const targetRect = elUnder.getBoundingClientRect();
+        const landY = Math.min(viewY + 12 + Math.random() * 20, targetRect.bottom - 3);
+
+        const delay = s * 40;
+        setTimeout(() => {
+          requestAnimationFrame(() => {
+            seed.style.transition = "top 0.35s cubic-bezier(0.55, 0, 1, 0.45), opacity 0.2s 0.4s";
+            seed.style.top = landY + "px";
+            setTimeout(() => {
+              seed.style.opacity = "0";
+              setTimeout(() => seed.remove(), 200);
+            }, 350);
+          });
+        }, delay);
+      }
+
+      // Delay growth until seed lands — pollen burst at landing
+      const landY2 = Math.min(viewY + 15, elUnder.getBoundingClientRect().bottom - 3);
+      setTimeout(() => {
+        spawnPollen(viewX, landY2, 8 + Math.floor(state.density * 8));
+        startGrowth(elUnder, viewX, landY2);
+      }, 300);
+    }
+
+    function startGrowth(el, viewX, viewY) {
+      const rect = el.getBoundingClientRect();
+      const localX = viewX - rect.left;
+      const localY = viewY - rect.top;
+
+      const plant = generatePlant(localX, localY, state.density, state.spread);
+      const { canvas, ctx, pad, w, h } = createGrowthCanvas(el);
+
+      // Compute total growth duration from max delay
+      let maxDelay = 0;
+      for (const s of plant.segments) maxDelay = Math.max(maxDelay, s.delay);
+      for (const l of plant.leaves) maxDelay = Math.max(maxDelay, l.delay);
+
+      growths.push({
+        el, canvas, ctx, pad, w, h, plant,
+        progress: 0,
+        totalDuration: maxDelay + 0.3, // segments + leaf fade-in time
+        done: false,
+      });
+    }
+
+    // ── Main loop ──
+    let running = true;
+    let raf = 0;
+    let lastTime = performance.now();
+    let windPhase = 0;
+
+    function tick() {
+      if (!running) return;
+      const now = performance.now();
+      const dt = Math.min((now - lastTime) / 1000, 0.05);
+      lastTime = now;
+      windPhase += dt;
+
+      // Cursor with bobbing seeds + click pulse
+      swingPhase += dt * 3;
+      clickPulse *= 0.88;
+      const cursorScale = 1 + clickPulse * 0.15;
+      cursorEl.style.left = state.cursorX + "px";
+      cursorEl.style.top = state.cursorY + "px";
+      cursorEl.style.transform =
+        `translate(-50%, -100%) rotate(${Math.sin(swingPhase) * 3}deg) scale(${cursorScale.toFixed(3)})`;
+      // Floating seed animation inside the bag
+      for (let i = 0; i < bobSeeds.length; i++) {
+        const bob = Math.sin(swingPhase * 1.5 + i * 1.1) * 0.8;
+        bobSeeds[i].setAttribute("cy", String(bobBaseCY[i] + bob));
+      }
+
+      // Grow + redraw plants (speed maps to ~0.8s–1.5s total duration)
+      const speed = 0.7 + state.growthSpeed * 0.8; // progress units per second
+      for (const g of growths) {
+        if (!g.done) {
+          g.progress = Math.min(g.progress + speed * dt, g.totalDuration);
+          if (g.progress >= g.totalDuration) g.done = true;
+        }
+        drawPlant(g, windPhase);
+      }
+
+      // Particles
+      pCtx.save();
+      pCtx.setTransform(1, 0, 0, 1, 0, 0);
+      pCtx.clearRect(0, 0, particleCanvas.width, particleCanvas.height);
+      pCtx.restore();
+
+      for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.life -= dt;
+        if (p.life <= 0) { particles.splice(i, 1); continue; }
+        const t = p.life / p.maxLife;
+        p.vy -= 8 * dt;
+        p.x += p.vx * dt + Math.sin(windPhase * 3 + i) * 0.3;
+        p.y += p.vy * dt;
+        p.vx *= 0.98;
+        pCtx.beginPath();
+        pCtx.arc(p.x, p.y, p.size * (0.5 + t * 0.5), 0, Math.PI * 2);
+        pCtx.fillStyle = `hsla(${p.hue}, 60%, 70%, ${t * 0.7})`;
+        pCtx.fill();
+        if (t > 0.5) {
+          pCtx.beginPath();
+          pCtx.arc(p.x, p.y, p.size * 2, 0, Math.PI * 2);
+          pCtx.fillStyle = `hsla(${p.hue}, 60%, 70%, ${t * 0.1})`;
+          pCtx.fill();
+        }
+      }
+
+      raf = requestAnimationFrame(tick);
+    }
+
+    return {
+      state, dropSeed,
+      start() { running = true; lastTime = performance.now(); tick(); },
+      update(nc) {
+        if ("sgGrowthSpeed" in nc) state.growthSpeed = clampUnit(Number(nc.sgGrowthSpeed));
+        if ("sgDensity" in nc) state.density = clampUnit(Number(nc.sgDensity));
+        if ("sgSpread" in nc) state.spread = clampUnit(Number(nc.sgSpread));
+      },
+      destroy() {
+        running = false;
+        cancelAnimationFrame(raf);
+        for (const g of growths) { if (g.canvas.parentNode) g.canvas.remove(); }
+        growths.length = 0;
+        document.querySelectorAll(".__sg_seed").forEach((s) => s.remove());
+        particleCanvas.remove();
+        cursorEl.remove();
+      },
+    };
+  }
+
   // ── Three.js horseshoe magnet cursor ──────────────────────────
   function createMagnetCursor() {
     const container = document.createElement("canvas");
@@ -2378,7 +2941,7 @@ void main() {
 
   if (window.__htmlShaderStop) window.__htmlShaderStop();
 
-  const engineKinds = ["fragment", "roll", "blackhole", "fireburn", "magnetic"];
+  const engineKinds = ["fragment", "roll", "blackhole", "fireburn", "magnetic", "seedgrowth"];
   const config =
     typeof rawConfig === "string"
       ? { engine: "fragment", fragSrc: rawConfig, rollProgress: 1 }
@@ -2400,6 +2963,9 @@ void main() {
           mgRadius: clampUnit(Number(rawConfig?.mgRadius ?? 0.5)),
           mgSmoothing: clampUnit(Number(rawConfig?.mgSmoothing ?? 0.5)),
           mgMode: rawConfig?.mgMode === "repel" ? "repel" : "attract",
+          sgGrowthSpeed: clampUnit(Number(rawConfig?.sgGrowthSpeed ?? 0.5)),
+          sgDensity: clampUnit(Number(rawConfig?.sgDensity ?? 0.5)),
+          sgSpread: clampUnit(Number(rawConfig?.sgSpread ?? 0.5)),
         };
 
   // ════════════════════════════════════════════════════════════════
@@ -2572,6 +3138,46 @@ void main() {
         mgCursor.destroy();
         cursorStyle.remove();
       }, 50);
+      delete window.__htmlShaderStop;
+      delete window.__htmlShaderUpdate;
+    };
+
+    window.__htmlShaderStop = stop;
+    window.__htmlShaderUpdate = (nextConfig) => {
+      if (!nextConfig) return;
+      engine.update(nextConfig);
+    };
+    return null;
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  // SEED GROWTH — DOM-based engine (no WebGL, no drawElement)
+  // ════════════════════════════════════════════════════════════════
+  if (config.engine === "seedgrowth") {
+    const engine = createSeedGrowthEngine(config);
+
+    const cursorStyle = document.createElement("style");
+    cursorStyle.id = "__html_shader_sg_style__";
+    cursorStyle.textContent = "* { cursor: none !important; }";
+    document.head.appendChild(cursorStyle);
+
+    const onMouseMove = (e) => {
+      engine.state.cursorX = e.clientX;
+      engine.state.cursorY = e.clientY;
+    };
+    const onClick = (e) => {
+      engine.dropSeed(e.clientX, e.clientY);
+    };
+    addEventListener("mousemove", onMouseMove);
+    addEventListener("click", onClick);
+
+    engine.start();
+
+    const stop = () => {
+      removeEventListener("mousemove", onMouseMove);
+      removeEventListener("click", onClick);
+      engine.destroy();
+      cursorStyle.remove();
       delete window.__htmlShaderStop;
       delete window.__htmlShaderUpdate;
     };
