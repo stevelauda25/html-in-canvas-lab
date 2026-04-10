@@ -179,6 +179,34 @@ void main() {
 // organic vine/branch structures. Growth is progressive
 // from root to stem to branches to leaves.`,
   },
+  liquid: {
+    kind: "liquid",
+    hint: "Cursor pushes DOM elements like a liquid surface. Elements spring back with soft-body physics. Adjust <code>force</code>, <code>radius</code>, <code>tension</code>, <code>damping</code> below.",
+    controls: [
+      { key: "lqForce", label: "Force", min: 0.1, max: 1, default: 0.5 },
+      { key: "lqRadius", label: "Radius", min: 0.1, max: 1, default: 0.5 },
+      { key: "lqTension", label: "Tension", min: 0.05, max: 1, default: 0.4 },
+      { key: "lqDamping", label: "Damping", min: 0.05, max: 1, default: 0.5 },
+    ],
+    source: `// Built-in Liquid UI preset.
+// DOM elements behave like a soft fluid surface.
+// Cursor pushes nearby elements; they spring back.
+// Neighbor influence creates ripple propagation.
+// No canvas, no overlay — pure DOM transforms.`,
+  },
+  storm: {
+    kind: "storm",
+    hint: "Cursor generates a storm. Wind pushes elements permanently. Lightning flashes. A 3D tornado follows the cursor. Adjust <code>wind</code>, <code>radius</code>, <code>chaos</code> below.",
+    controls: [
+      { key: "stWind", label: "Wind force", min: 0.1, max: 1, default: 0.5 },
+      { key: "stRadius", label: "Radius", min: 0.1, max: 1, default: 0.5 },
+      { key: "stChaos", label: "Chaos", min: 0, max: 1, default: 0.4 },
+    ],
+    source: `// Built-in Storm preset.
+// Cursor generates directional wind. Elements are pushed and stay
+// displaced (no spring-back). Tornado cursor, lightning flashes,
+// wind streaks, debris particles, vignette darkening.`,
+  },
 };
 
 const DEFAULT_PRESET = "blur";
@@ -2530,6 +2558,728 @@ void main() {
     };
   }
 
+  // ── Liquid UI DOM engine ────────────────────────────────────────
+  // No-persistence model: displacement is computed each frame from
+  // cursor position. No velocity accumulation. Elements relax via
+  // spring damping when cursor is away. Includes a cursor ring
+  // indicator showing the interaction radius.
+  function createLiquidEngine(config) {
+    const state = {
+      cursorX: -9999,
+      cursorY: -9999,
+      smoothX: -9999,
+      smoothY: -9999,
+      prevSmoothX: -9999,
+      prevSmoothY: -9999,
+      active: false,
+      force: clampUnit(Number(config.lqForce ?? 0.5)),
+      radius: clampUnit(Number(config.lqRadius ?? 0.5)),
+      tension: clampUnit(Number(config.lqTension ?? 0.4)),
+      damping: clampUnit(Number(config.lqDamping ?? 0.5)),
+      nearCount: 0, // how many elements are currently affected
+    };
+
+    const getRadiusPx = () => 60 + state.radius * 250;
+
+    // Per-element: current smoothed displacement + deformation
+    // No velocity stored — displacement is target-driven, not force-driven
+    const tracked = new Map(); // el → { tx, ty, rot, sx, sy }
+
+    const SKIP_SELECTOR = "[id^='__html_shader']";
+
+    function getTargetElements() {
+      const all = document.body.querySelectorAll(
+        "h1,h2,h3,h4,h5,h6,p,a,button,img,li,span," +
+          "div,section,nav,article,header,footer,ul,ol," +
+          "input,textarea,select,label,code,pre,blockquote," +
+          "table,tr,td,th,figure,figcaption,svg",
+      );
+      const results = [];
+      for (const el of all) {
+        if (el.closest(SKIP_SELECTOR)) continue;
+        const hasChild = el.querySelector(
+          "h1,h2,h3,p,a,button,img,li,span,code,pre",
+        );
+        if (!hasChild || el.tagName === "LI" || el.tagName === "A") {
+          results.push(el);
+        }
+      }
+      return results;
+    }
+
+    function ensureTracked(el) {
+      if (tracked.has(el)) return tracked.get(el);
+      const t = { tx: 0, ty: 0, rot: 0, sx: 1, sy: 1 };
+      tracked.set(el, t);
+      return t;
+    }
+
+    // ── Cursor ring indicator ──
+    const ring = document.createElement("div");
+    ring.id = "__html_shader_lq_ring__";
+    Object.assign(ring.style, {
+      position: "fixed",
+      pointerEvents: "none",
+      zIndex: "2147483647",
+      borderRadius: "50%",
+      border: "1.5px solid rgba(120, 180, 255, 0.25)",
+      boxShadow: "0 0 15px 2px rgba(100, 160, 255, 0.08), inset 0 0 10px rgba(100, 160, 255, 0.04)",
+      transform: "translate(-50%, -50%)",
+      opacity: "0",
+      transition: "opacity 0.3s",
+    });
+    document.body.appendChild(ring);
+
+    let running = true;
+    let raf = 0;
+    let lastTime = performance.now();
+    let pulsePhase = 0;
+
+    function tick() {
+      if (!running) return;
+      const now = performance.now();
+      const dt = Math.min((now - lastTime) / 1000, 0.05);
+      lastTime = now;
+      pulsePhase += dt;
+
+      const isOnPage = state.cursorX > -999 && state.active;
+      const radiusPx = getRadiusPx();
+
+      // Smooth cursor position (slight lag for premium feel)
+      if (isOnPage) {
+        const lr = 0.15 + state.damping * 0.1;
+        state.smoothX += (state.cursorX - state.smoothX) * lr;
+        state.smoothY += (state.cursorY - state.smoothY) * lr;
+      }
+
+      const cx = state.smoothX;
+      const cy = state.smoothY;
+
+      // Cursor velocity (for directional bias)
+      const cvx = cx - state.prevSmoothX;
+      const cvy = cy - state.prevSmoothY;
+      const cspeed = Math.sqrt(cvx * cvx + cvy * cvy);
+      state.prevSmoothX = cx;
+      state.prevSmoothY = cy;
+
+      // Physics params
+      const maxDisp = 12 + state.force * 28; // max displacement 12-40px
+      const relaxSpeed = 5 + state.tension * 15; // spring rate for return
+      const dampRate = 0.1 + state.damping * 0.25;
+      const neighborRange = 150 + state.radius * 100;
+      const neighborStr = 0.12;
+
+      const elements = getTargetElements();
+
+      // ── Phase 1: compute target displacement for each element ──
+      const frameData = []; // { el, t, targetTx, targetTy, ecx, ecy }
+      let nearCount = 0;
+
+      for (const el of elements) {
+        const t = ensureTracked(el);
+        const rect = el.getBoundingClientRect();
+        const ecx = rect.left + rect.width / 2;
+        const ecy = rect.top + rect.height / 2;
+
+        let targetTx = 0;
+        let targetTy = 0;
+
+        if (isOnPage) {
+          const dx = ecx - cx;
+          const dy = ecy - cy;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+
+          if (dist < radiusPx && dist > 1) {
+            nearCount++;
+            const norm = 1 - dist / radiusPx;
+            const influence = norm * norm * norm; // cubic falloff: very soft at edges
+
+            const dirX = dx / dist;
+            const dirY = dy / dist;
+
+            // Push: radial + velocity bias
+            const moveBias = Math.min(cspeed * 0.1, 0.6);
+            targetTx = (dirX * maxDisp * (0.5 + moveBias * 0.5) +
+                         cvx * influence * 0.4) * influence;
+            targetTy = (dirY * maxDisp * (0.5 + moveBias * 0.5) +
+                         cvy * influence * 0.4) * influence;
+          }
+        }
+
+        frameData.push({ el, t, targetTx, targetTy, ecx, ecy });
+      }
+      state.nearCount = nearCount;
+
+      // ── Phase 2: neighbor influence (soft ripple) ──
+      for (let i = 0; i < frameData.length; i++) {
+        const a = frameData[i];
+        if (Math.abs(a.targetTx) < 0.1 && Math.abs(a.targetTy) < 0.1) continue;
+
+        for (let j = i + 1; j < frameData.length; j++) {
+          const b = frameData[j];
+          const ndx = a.ecx - b.ecx;
+          const ndy = a.ecy - b.ecy;
+          const ndist = Math.sqrt(ndx * ndx + ndy * ndy);
+          if (ndist > neighborRange || ndist < 1) continue;
+
+          const nInf = (1 - ndist / neighborRange) * neighborStr;
+          b.targetTx += a.targetTx * nInf;
+          b.targetTy += a.targetTy * nInf;
+          // Slight counter-push on source
+          a.targetTx -= b.targetTx * nInf * 0.3;
+          a.targetTy -= b.targetTy * nInf * 0.3;
+        }
+      }
+
+      // ── Phase 3: lerp current toward target, apply transforms ──
+      for (const { el, t, targetTx, targetTy } of frameData) {
+        // Spring toward target (or toward 0 if no target)
+        const lerpRate = Math.min(relaxSpeed * dt, 0.5);
+        t.tx += (targetTx - t.tx) * lerpRate;
+        t.ty += (targetTy - t.ty) * lerpRate;
+
+        // Dampen toward zero when very close
+        if (Math.abs(targetTx) < 0.01 && Math.abs(targetTy) < 0.01) {
+          t.tx *= (1 - dampRate);
+          t.ty *= (1 - dampRate);
+        }
+
+        // Rotation from displacement direction (very subtle)
+        const targetRot = t.tx * 0.08 - t.ty * 0.04;
+        t.rot += (targetRot - t.rot) * lerpRate;
+
+        // Squash/stretch from displacement magnitude
+        const disp = Math.sqrt(t.tx * t.tx + t.ty * t.ty);
+        const squash = Math.min(disp * 0.002, 0.04);
+        const targetSx = 1 + squash;
+        const targetSy = 1 - squash * 0.4;
+        t.sx += (targetSx - t.sx) * lerpRate;
+        t.sy += (targetSy - t.sy) * lerpRate;
+
+        const isMoving = Math.abs(t.tx) > 0.03 || Math.abs(t.ty) > 0.03 ||
+                          Math.abs(t.rot) > 0.01 ||
+                          Math.abs(t.sx - 1) > 0.0005;
+
+        if (isMoving) {
+          el.style.transition = "none";
+          el.style.transform =
+            `translate(${t.tx.toFixed(2)}px, ${t.ty.toFixed(2)}px) ` +
+            `rotate(${t.rot.toFixed(2)}deg) ` +
+            `scale(${t.sx.toFixed(4)}, ${t.sy.toFixed(4)})`;
+        } else {
+          if (el.style.transform) el.style.transform = "";
+          t.tx = 0; t.ty = 0; t.rot = 0; t.sx = 1; t.sy = 1;
+        }
+      }
+
+      // ── Cursor ring indicator ──
+      if (isOnPage) {
+        ring.style.opacity = "1";
+        const pulse = 1 + Math.sin(pulsePhase * 2.5) * 0.02;
+        // Feedback: brighter + slightly larger when affecting elements
+        const feedback = nearCount > 0 ? 1 : 0;
+        const ringScale = pulse + feedback * 0.03;
+        const ringSize = radiusPx * 2 * ringScale;
+        ring.style.left = cx + "px";
+        ring.style.top = cy + "px";
+        ring.style.width = ringSize + "px";
+        ring.style.height = ringSize + "px";
+        const glowAlpha = 0.08 + feedback * 0.08;
+        const borderAlpha = 0.25 + feedback * 0.15;
+        ring.style.border = `1.5px solid rgba(120, 180, 255, ${borderAlpha})`;
+        ring.style.boxShadow =
+          `0 0 ${15 + feedback * 10}px 2px rgba(100, 160, 255, ${glowAlpha}), ` +
+          `inset 0 0 10px rgba(100, 160, 255, ${glowAlpha * 0.5})`;
+      } else {
+        ring.style.opacity = "0";
+      }
+
+      raf = requestAnimationFrame(tick);
+    }
+
+    return {
+      state,
+      start() {
+        running = true;
+        lastTime = performance.now();
+        tick();
+      },
+      update(nextConfig) {
+        if ("lqForce" in nextConfig) state.force = clampUnit(Number(nextConfig.lqForce));
+        if ("lqRadius" in nextConfig) state.radius = clampUnit(Number(nextConfig.lqRadius));
+        if ("lqTension" in nextConfig) state.tension = clampUnit(Number(nextConfig.lqTension));
+        if ("lqDamping" in nextConfig) state.damping = clampUnit(Number(nextConfig.lqDamping));
+      },
+      destroy() {
+        running = false;
+        cancelAnimationFrame(raf);
+        for (const [el] of tracked) {
+          el.style.transform = "";
+          el.style.transition = "";
+        }
+        tracked.clear();
+        ring.remove();
+      },
+    };
+  }
+
+  // ── Storm / Flow Field engine ───────────────────────────────────
+  // Cursor = wind source. Elements are pushed cumulatively (NO return).
+  // Includes storm overlay (wind streaks + vignette + lightning + debris)
+  // and a Three.js tornado cursor.
+  function createStormEngine(config) {
+    const state = {
+      cursorX: -9999, cursorY: -9999,
+      smoothX: -9999, smoothY: -9999,
+      prevSX: -9999, prevSY: -9999,
+      active: false,
+      wind: clampUnit(Number(config.stWind ?? 0.5)),
+      radius: clampUnit(Number(config.stRadius ?? 0.5)),
+      chaos: clampUnit(Number(config.stChaos ?? 0.4)),
+    };
+
+    const getRadiusPx = () => 80 + state.radius * 300;
+    const pDpr = Math.min(window.devicePixelRatio || 1, 2);
+
+    // Per-element: cumulative displacement + velocity (NO spring-back)
+    const tracked = new Map(); // el → { tx, ty, vx, vy, rot }
+
+    const SKIP_SELECTOR = "[id^='__html_shader']";
+
+    function getTargetElements() {
+      const all = document.body.querySelectorAll(
+        "h1,h2,h3,h4,h5,h6,p,a,button,img,li,span," +
+          "div,section,nav,article,header,footer,ul,ol," +
+          "input,textarea,select,label,code,pre,blockquote," +
+          "table,tr,td,th,figure,figcaption,svg",
+      );
+      const results = [];
+      for (const el of all) {
+        if (el.closest(SKIP_SELECTOR)) continue;
+        const hasChild = el.querySelector("h1,h2,h3,p,a,button,img,li,span,code,pre");
+        if (!hasChild || el.tagName === "LI" || el.tagName === "A") results.push(el);
+      }
+      return results;
+    }
+
+    function ensureTracked(el) {
+      if (tracked.has(el)) return tracked.get(el);
+      const t = { tx: 0, ty: 0, vx: 0, vy: 0, rot: 0 };
+      tracked.set(el, t);
+      return t;
+    }
+
+    // ── Storm overlay canvas (wind streaks + debris + lightning) ──
+    const overlayCanvas = document.createElement("canvas");
+    overlayCanvas.id = "__html_shader_storm_overlay__";
+    Object.assign(overlayCanvas.style, {
+      position: "fixed", inset: "0",
+      width: "100vw", height: "100vh",
+      pointerEvents: "none", zIndex: "2147483646",
+    });
+    overlayCanvas.width = Math.floor(innerWidth * pDpr);
+    overlayCanvas.height = Math.floor(innerHeight * pDpr);
+    document.body.appendChild(overlayCanvas);
+    const oCtx = overlayCanvas.getContext("2d");
+    oCtx.scale(pDpr, pDpr);
+
+    // ── Vignette overlay ──
+    const vignette = document.createElement("div");
+    vignette.id = "__html_shader_storm_vignette__";
+    Object.assign(vignette.style, {
+      position: "fixed", inset: "0",
+      width: "100vw", height: "100vh",
+      pointerEvents: "none", zIndex: "2147483645",
+      background: "radial-gradient(ellipse at center, transparent 40%, rgba(0,0,0,0.35) 100%)",
+    });
+    document.body.appendChild(vignette);
+
+    // Wind streaks
+    const streaks = [];
+    const MAX_STREAKS = 60;
+    // Debris particles
+    const debris = [];
+    const MAX_DEBRIS = 80;
+    // Lightning state
+    let lightningTimer = 2 + Math.random() * 4;
+    let lightningFlash = 0;
+    let lightningBolts = [];
+
+    function spawnStreak(windDx, windDy) {
+      if (streaks.length >= MAX_STREAKS) return;
+      const speed = 200 + Math.random() * 400;
+      const len = 20 + Math.random() * 60;
+      streaks.push({
+        x: Math.random() * innerWidth,
+        y: Math.random() * innerHeight,
+        vx: windDx * speed + (Math.random() - 0.5) * 50,
+        vy: windDy * speed + (Math.random() - 0.5) * 50,
+        len, life: 0.3 + Math.random() * 0.5, maxLife: 0.3 + Math.random() * 0.5,
+        alpha: 0.1 + Math.random() * 0.15,
+      });
+    }
+
+    function spawnDebris(x, y, windDx, windDy) {
+      if (debris.length >= MAX_DEBRIS) return;
+      debris.push({
+        x: x + (Math.random() - 0.5) * 100,
+        y: y + (Math.random() - 0.5) * 100,
+        vx: windDx * (80 + Math.random() * 120) + (Math.random() - 0.5) * 40,
+        vy: windDy * (80 + Math.random() * 120) + (Math.random() - 0.5) * 40 - 20,
+        rot: Math.random() * 360, rotSpeed: (Math.random() - 0.5) * 300,
+        size: 1.5 + Math.random() * 3,
+        life: 1 + Math.random() * 2, maxLife: 1 + Math.random() * 2,
+        hue: Math.random() > 0.5 ? 30 + Math.random() * 20 : 100 + Math.random() * 40,
+      });
+    }
+
+    function generateLightningBolt(x1, y1, x2, y2, depth) {
+      const bolts = [];
+      const dx = x2 - x1;
+      const dy = y2 - y1;
+      const segments = 6 + Math.floor(Math.random() * 6);
+      let cx = x1, cy = y1;
+      const points = [{ x: cx, y: cy }];
+
+      for (let i = 1; i <= segments; i++) {
+        const t = i / segments;
+        cx = x1 + dx * t + (Math.random() - 0.5) * 80 * (1 - depth * 0.3);
+        cy = y1 + dy * t + (Math.random() - 0.5) * 40;
+        points.push({ x: cx, y: cy });
+
+        // Branch
+        if (depth < 2 && Math.random() > 0.6) {
+          const bx = cx + (Math.random() - 0.5) * 120;
+          const by = cy + 30 + Math.random() * 80;
+          bolts.push(...generateLightningBolt(cx, cy, bx, by, depth + 1));
+        }
+      }
+
+      bolts.push({ points, width: Math.max(0.5, 2.5 - depth * 0.8), alpha: 1 - depth * 0.3 });
+      return bolts;
+    }
+
+    function triggerLightning() {
+      const x = Math.random() * innerWidth;
+      lightningBolts = generateLightningBolt(
+        x, -10, x + (Math.random() - 0.5) * 200, innerHeight * (0.5 + Math.random() * 0.4), 0,
+      );
+      lightningFlash = 1;
+    }
+
+    let running = true;
+    let raf = 0;
+    let lastTime = performance.now();
+
+    function tick() {
+      if (!running) return;
+      const now = performance.now();
+      const dt = Math.min((now - lastTime) / 1000, 0.05);
+      lastTime = now;
+
+      const isOnPage = state.cursorX > -999 && state.active;
+
+      // Smooth cursor
+      if (isOnPage) {
+        state.smoothX += (state.cursorX - state.smoothX) * 0.12;
+        state.smoothY += (state.cursorY - state.smoothY) * 0.12;
+      }
+      const cx = state.smoothX;
+      const cy = state.smoothY;
+      const cvx = cx - state.prevSX;
+      const cvy = cy - state.prevSY;
+      state.prevSX = cx;
+      state.prevSY = cy;
+      const cspeed = Math.sqrt(cvx * cvx + cvy * cvy);
+      const radiusPx = getRadiusPx();
+
+      // Normalized wind direction
+      const windMag = Math.min(cspeed, 30);
+      const windDx = windMag > 0.5 ? cvx / cspeed : 0;
+      const windDy = windMag > 0.5 ? cvy / cspeed : 0;
+
+      const maxVel = 8 + state.wind * 20;
+      const dampFactor = 0.02 + (1 - state.chaos) * 0.06;
+      const forceMag = 5 + state.wind * 30;
+
+      // ── Push DOM elements (cumulative, NO return) ──
+      if (isOnPage && cspeed > 1) {
+        const elements = getTargetElements();
+        for (const el of elements) {
+          const t = ensureTracked(el);
+          const rect = el.getBoundingClientRect();
+          const ecx = rect.left + rect.width / 2;
+          const ecy = rect.top + rect.height / 2;
+          const dx = ecx - cx;
+          const dy = ecy - cy;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+
+          if (dist < radiusPx && dist > 1) {
+            const norm = 1 - dist / radiusPx;
+            const influence = norm * norm;
+
+            // Wind push (directional) + radial push (away from cursor)
+            const radX = dx / dist;
+            const radY = dy / dist;
+            const fx = (windDx * 0.7 + radX * 0.3) * influence * forceMag;
+            const fy = (windDy * 0.7 + radY * 0.3) * influence * forceMag;
+
+            // Chaos: add random perturbation
+            const chaosX = (Math.random() - 0.5) * state.chaos * 8 * influence;
+            const chaosY = (Math.random() - 0.5) * state.chaos * 8 * influence;
+
+            t.vx += (fx + chaosX) * dt;
+            t.vy += (fy + chaosY) * dt;
+          }
+        }
+      }
+
+      // Integrate all tracked elements
+      for (const [el, t] of tracked) {
+        // Clamp velocity
+        const speed = Math.sqrt(t.vx * t.vx + t.vy * t.vy);
+        if (speed > maxVel) {
+          t.vx = (t.vx / speed) * maxVel;
+          t.vy = (t.vy / speed) * maxVel;
+        }
+
+        // Damping (natural friction, NOT spring-back)
+        t.vx *= (1 - dampFactor);
+        t.vy *= (1 - dampFactor);
+
+        // Integrate position (cumulative)
+        t.tx += t.vx;
+        t.ty += t.vy;
+
+        // Rotation from velocity
+        const targetRot = t.vx * 0.3 + (Math.random() - 0.5) * state.chaos * 0.5;
+        t.rot += (targetRot - t.rot) * 0.08;
+
+        if (Math.abs(t.vx) > 0.01 || Math.abs(t.vy) > 0.01 ||
+            Math.abs(t.tx) > 0.1 || Math.abs(t.ty) > 0.1) {
+          el.style.transition = "none";
+          el.style.transform =
+            `translate(${t.tx.toFixed(1)}px, ${t.ty.toFixed(1)}px) rotate(${t.rot.toFixed(1)}deg)`;
+        }
+      }
+
+      // ── Spawn wind streaks + debris ──
+      if (isOnPage && cspeed > 2) {
+        for (let i = 0; i < Math.floor(cspeed * 0.3); i++) spawnStreak(windDx, windDy);
+        if (Math.random() < 0.3) spawnDebris(cx, cy, windDx, windDy);
+      }
+
+      // ── Lightning timer ──
+      lightningTimer -= dt;
+      if (lightningTimer <= 0) {
+        triggerLightning();
+        lightningTimer = 3 + Math.random() * 6;
+      }
+      lightningFlash *= 0.85;
+
+      // ── Draw overlay ──
+      oCtx.save();
+      oCtx.setTransform(1, 0, 0, 1, 0, 0);
+      oCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+      oCtx.restore();
+
+      // Lightning flash
+      if (lightningFlash > 0.05) {
+        oCtx.save();
+        oCtx.setTransform(1, 0, 0, 1, 0, 0);
+        oCtx.fillStyle = `rgba(200, 210, 255, ${lightningFlash * 0.15})`;
+        oCtx.fillRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+        oCtx.restore();
+      }
+
+      // Lightning bolts
+      if (lightningFlash > 0.1) {
+        for (const bolt of lightningBolts) {
+          if (bolt.points.length < 2) continue;
+          oCtx.beginPath();
+          oCtx.moveTo(bolt.points[0].x, bolt.points[0].y);
+          for (let i = 1; i < bolt.points.length; i++) {
+            oCtx.lineTo(bolt.points[i].x, bolt.points[i].y);
+          }
+          oCtx.strokeStyle = `rgba(180, 200, 255, ${bolt.alpha * lightningFlash})`;
+          oCtx.lineWidth = bolt.width;
+          oCtx.lineCap = "round";
+          oCtx.lineJoin = "round";
+          oCtx.stroke();
+          // Glow
+          oCtx.strokeStyle = `rgba(150, 180, 255, ${bolt.alpha * lightningFlash * 0.3})`;
+          oCtx.lineWidth = bolt.width * 4;
+          oCtx.stroke();
+        }
+      }
+
+      // Wind streaks
+      for (let i = streaks.length - 1; i >= 0; i--) {
+        const s = streaks[i];
+        s.life -= dt;
+        if (s.life <= 0) { streaks.splice(i, 1); continue; }
+        s.x += s.vx * dt;
+        s.y += s.vy * dt;
+        const t = s.life / s.maxLife;
+        const sLen = s.len * t;
+        const angle = Math.atan2(s.vy, s.vx);
+        oCtx.beginPath();
+        oCtx.moveTo(s.x, s.y);
+        oCtx.lineTo(s.x - Math.cos(angle) * sLen, s.y - Math.sin(angle) * sLen);
+        oCtx.strokeStyle = `rgba(200, 210, 220, ${s.alpha * t})`;
+        oCtx.lineWidth = 0.8;
+        oCtx.stroke();
+      }
+
+      // Debris
+      for (let i = debris.length - 1; i >= 0; i--) {
+        const d = debris[i];
+        d.life -= dt;
+        if (d.life <= 0) { debris.splice(i, 1); continue; }
+        d.vy += 15 * dt; // gravity
+        d.x += d.vx * dt;
+        d.y += d.vy * dt;
+        d.rot += d.rotSpeed * dt;
+        const t = d.life / d.maxLife;
+        oCtx.save();
+        oCtx.translate(d.x, d.y);
+        oCtx.rotate(d.rot * Math.PI / 180);
+        oCtx.fillStyle = `hsla(${d.hue}, 40%, 45%, ${t * 0.6})`;
+        oCtx.fillRect(-d.size / 2, -d.size / 2, d.size, d.size * 0.6);
+        oCtx.restore();
+      }
+
+      raf = requestAnimationFrame(tick);
+    }
+
+    return {
+      state,
+      start() { running = true; lastTime = performance.now(); tick(); },
+      update(nc) {
+        if ("stWind" in nc) state.wind = clampUnit(Number(nc.stWind));
+        if ("stRadius" in nc) state.radius = clampUnit(Number(nc.stRadius));
+        if ("stChaos" in nc) state.chaos = clampUnit(Number(nc.stChaos));
+      },
+      destroy() {
+        running = false;
+        cancelAnimationFrame(raf);
+        for (const [el] of tracked) {
+          el.style.transform = "";
+          el.style.transition = "";
+        }
+        tracked.clear();
+        overlayCanvas.remove();
+        vignette.remove();
+      },
+    };
+  }
+
+  // ── Three.js tornado cursor ───────────────────────────────────
+  function createTornadoCursor() {
+    const container = document.createElement("canvas");
+    container.id = "__html_shader_storm_tornado__";
+    const size = 200;
+    container.width = size * (window.devicePixelRatio || 1);
+    container.height = size * (window.devicePixelRatio || 1);
+    Object.assign(container.style, {
+      position: "fixed",
+      width: size + "px", height: size + "px",
+      pointerEvents: "none", zIndex: "2147483647",
+      transform: "translate(-50%, -50%)",
+      top: "50%", left: "50%",
+    });
+    document.body.appendChild(container);
+
+    let THREE = null;
+    let scene, camera, rendererTjs, vortexGroup;
+    let ready = false;
+
+    const script = document.createElement("script");
+    script.src = "https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js";
+    script.onload = () => { THREE = window.THREE; initScene(); };
+    document.head.appendChild(script);
+
+    function initScene() {
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
+      camera.position.z = 4;
+      camera.position.y = 0.5;
+
+      rendererTjs = new THREE.WebGLRenderer({ canvas: container, alpha: true, antialias: true });
+      rendererTjs.setSize(size, size);
+      rendererTjs.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+      rendererTjs.setClearColor(0x000000, 0);
+
+      vortexGroup = new THREE.Group();
+      scene.add(vortexGroup);
+
+      // Spiral particle rings at different heights
+      for (let ring = 0; ring < 6; ring++) {
+        const y = -1.2 + ring * 0.45;
+        const radius = 0.15 + ring * 0.12;
+        const count = 20 + ring * 8;
+        const geo = new THREE.BufferGeometry();
+        const pos = new Float32Array(count * 3);
+        for (let i = 0; i < count; i++) {
+          const a = (i / count) * Math.PI * 2;
+          pos[i * 3] = Math.cos(a) * radius + (Math.random() - 0.5) * 0.05;
+          pos[i * 3 + 1] = y + (Math.random() - 0.5) * 0.15;
+          pos[i * 3 + 2] = Math.sin(a) * radius + (Math.random() - 0.5) * 0.05;
+        }
+        geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+        const mat = new THREE.PointsMaterial({
+          color: ring < 3 ? 0x667788 : 0x8899aa,
+          size: 0.025 + ring * 0.005,
+          transparent: true,
+          opacity: 0.5 + ring * 0.05,
+        });
+        const points = new THREE.Points(geo, mat);
+        points.userData.ringY = y;
+        points.userData.ringSpeed = 2 + ring * 0.5;
+        vortexGroup.add(points);
+      }
+
+      // Central funnel cone
+      const coneGeo = new THREE.ConeGeometry(0.08, 2.4, 12, 1, true);
+      const coneMat = new THREE.MeshBasicMaterial({
+        color: 0x556677, transparent: true, opacity: 0.15, side: THREE.DoubleSide,
+      });
+      const cone = new THREE.Mesh(coneGeo, coneMat);
+      cone.position.y = -0.1;
+      vortexGroup.add(cone);
+
+      ready = true;
+    }
+
+    return {
+      update(mouseX, mouseY, intensity, time) {
+        container.style.left = mouseX + "px";
+        container.style.top = mouseY + "px";
+        const s = 0.7 + intensity * 0.5;
+        container.style.width = size * s + "px";
+        container.style.height = size * s + "px";
+
+        if (!ready) return;
+
+        // Rotate each ring at its own speed
+        for (const child of vortexGroup.children) {
+          if (child.userData.ringSpeed) {
+            child.rotation.y = time * child.userData.ringSpeed;
+          }
+        }
+        vortexGroup.rotation.y = time * 0.3;
+
+        rendererTjs.render(scene, camera);
+      },
+      destroy() {
+        if (rendererTjs) rendererTjs.dispose();
+        container.remove();
+        const s = document.querySelector('script[src*="three.min.js"]');
+        if (s) s.remove();
+      },
+    };
+  }
+
   // ── Three.js horseshoe magnet cursor ──────────────────────────
   function createMagnetCursor() {
     const container = document.createElement("canvas");
@@ -2823,7 +3573,7 @@ void main() {
 
   if (window.__htmlShaderStop) window.__htmlShaderStop();
 
-  const engineKinds = ["fragment", "roll", "blackhole", "fireburn", "magnetic", "seedgrowth"];
+  const engineKinds = ["fragment", "roll", "blackhole", "fireburn", "magnetic", "seedgrowth", "liquid", "storm"];
   const config =
     typeof rawConfig === "string"
       ? { engine: "fragment", fragSrc: rawConfig, rollProgress: 1 }
@@ -2848,6 +3598,13 @@ void main() {
           sgGrowthSpeed: clampUnit(Number(rawConfig?.sgGrowthSpeed ?? 0.5)),
           sgDensity: clampUnit(Number(rawConfig?.sgDensity ?? 0.5)),
           sgSpread: clampUnit(Number(rawConfig?.sgSpread ?? 0.5)),
+          lqForce: clampUnit(Number(rawConfig?.lqForce ?? 0.5)),
+          lqRadius: clampUnit(Number(rawConfig?.lqRadius ?? 0.5)),
+          lqTension: clampUnit(Number(rawConfig?.lqTension ?? 0.4)),
+          lqDamping: clampUnit(Number(rawConfig?.lqDamping ?? 0.5)),
+          stWind: clampUnit(Number(rawConfig?.stWind ?? 0.5)),
+          stRadius: clampUnit(Number(rawConfig?.stRadius ?? 0.5)),
+          stChaos: clampUnit(Number(rawConfig?.stChaos ?? 0.4)),
         };
 
   // ════════════════════════════════════════════════════════════════
@@ -3059,6 +3816,113 @@ void main() {
       removeEventListener("mousemove", onMouseMove);
       removeEventListener("click", onClick);
       engine.destroy();
+      cursorStyle.remove();
+      delete window.__htmlShaderStop;
+      delete window.__htmlShaderUpdate;
+    };
+
+    window.__htmlShaderStop = stop;
+    window.__htmlShaderUpdate = (nextConfig) => {
+      if (!nextConfig) return;
+      engine.update(nextConfig);
+    };
+    return null;
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  // LIQUID UI — DOM-based soft-body engine (no WebGL, no canvas)
+  // ════════════════════════════════════════════════════════════════
+  if (config.engine === "liquid") {
+    const engine = createLiquidEngine(config);
+
+    const onMouseMove = (e) => {
+      if (!engine.state.active) {
+        engine.state.active = true;
+        engine.state.prevCursorX = e.clientX;
+        engine.state.prevCursorY = e.clientY;
+      }
+      engine.state.cursorX = e.clientX;
+      engine.state.cursorY = e.clientY;
+    };
+    const onMouseLeave = () => {
+      engine.state.active = false;
+      engine.state.cursorX = -9999;
+      engine.state.cursorY = -9999;
+    };
+    addEventListener("mousemove", onMouseMove);
+    document.documentElement.addEventListener("mouseleave", onMouseLeave);
+
+    engine.start();
+
+    const stop = () => {
+      removeEventListener("mousemove", onMouseMove);
+      document.documentElement.removeEventListener("mouseleave", onMouseLeave);
+      engine.destroy();
+      delete window.__htmlShaderStop;
+      delete window.__htmlShaderUpdate;
+    };
+
+    window.__htmlShaderStop = stop;
+    window.__htmlShaderUpdate = (nextConfig) => {
+      if (!nextConfig) return;
+      engine.update(nextConfig);
+    };
+    return null;
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  // STORM — DOM-based flow field + canvas overlay + Three.js tornado
+  // ════════════════════════════════════════════════════════════════
+  if (config.engine === "storm") {
+    const engine = createStormEngine(config);
+    const tornado = createTornadoCursor();
+
+    const cursorStyle = document.createElement("style");
+    cursorStyle.id = "__html_shader_storm_style__";
+    cursorStyle.textContent = "* { cursor: none !important; }";
+    document.head.appendChild(cursorStyle);
+
+    const startTime = performance.now();
+
+    const onMouseMove = (e) => {
+      if (!engine.state.active) {
+        engine.state.active = true;
+        engine.state.smoothX = e.clientX;
+        engine.state.smoothY = e.clientY;
+        engine.state.prevSX = e.clientX;
+        engine.state.prevSY = e.clientY;
+      }
+      engine.state.cursorX = e.clientX;
+      engine.state.cursorY = e.clientY;
+    };
+    const onMouseLeave = () => {
+      engine.state.active = false;
+      engine.state.cursorX = -9999;
+      engine.state.cursorY = -9999;
+    };
+    addEventListener("mousemove", onMouseMove);
+    document.documentElement.addEventListener("mouseleave", onMouseLeave);
+
+    engine.start();
+
+    // Tornado animation loop
+    const tornadoFrame = () => {
+      if (!engine.state) return;
+      tornado.update(
+        engine.state.smoothX,
+        engine.state.smoothY,
+        engine.state.wind,
+        (performance.now() - startTime) / 1000,
+      );
+      requestAnimationFrame(tornadoFrame);
+    };
+    requestAnimationFrame(tornadoFrame);
+
+    const stop = () => {
+      removeEventListener("mousemove", onMouseMove);
+      document.documentElement.removeEventListener("mouseleave", onMouseLeave);
+      engine.destroy();
+      tornado.destroy();
       cursorStyle.remove();
       delete window.__htmlShaderStop;
       delete window.__htmlShaderUpdate;
