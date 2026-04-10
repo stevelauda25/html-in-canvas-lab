@@ -53,6 +53,7 @@
       <option value="roll">Preset: 3D Roll</option>
       <option value="blackhole">Preset: Black Hole</option>
       <option value="fireburn">Preset: Fire Burn</option>
+      <option value="magnetic">Preset: Magnetic Field</option>
     </select>
     <div class="editor">
       <pre id="shader-hl"><code></code></pre>
@@ -125,6 +126,39 @@
           <span id="fb_particles_value">0.60</span>
         </label>
         <input id="fb_particles" type="range" min="0.1" max="1" step="0.01" value="0.6" />
+      </div>
+    </div>
+    <div id="magnetic_controls" class="controls" hidden>
+      <div class="control">
+        <label for="mg_strength">
+          <span>Strength</span>
+          <span id="mg_strength_value">0.50</span>
+        </label>
+        <input id="mg_strength" type="range" min="0.05" max="1" step="0.01" value="0.5" />
+      </div>
+      <div class="control">
+        <label for="mg_radius">
+          <span>Radius</span>
+          <span id="mg_radius_value">0.50</span>
+        </label>
+        <input id="mg_radius" type="range" min="0.1" max="1" step="0.01" value="0.5" />
+      </div>
+      <div class="control">
+        <label for="mg_smoothing">
+          <span>Smoothing</span>
+          <span id="mg_smoothing_value">0.50</span>
+        </label>
+        <input id="mg_smoothing" type="range" min="0.05" max="1" step="0.01" value="0.5" />
+      </div>
+      <div class="control">
+        <label for="mg_mode">
+          <span>Mode</span>
+          <span id="mg_mode_value">attract</span>
+        </label>
+        <select id="mg_mode" style="width:100%;background:#1a1a1a;color:#eee;border:1px solid #333;padding:4px;border-radius:4px;">
+          <option value="attract">Attract</option>
+          <option value="repel">Repel</option>
+        </select>
       </div>
     </div>
     <div class="row">

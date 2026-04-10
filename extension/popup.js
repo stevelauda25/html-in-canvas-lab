@@ -149,6 +149,19 @@ void main() {
 //   Burn speed   how fast elements take damage
 //   Particles    particle density multiplier`,
   },
+  magnetic: {
+    kind: "magnetic",
+    source: `// Built-in Magnetic Field preset.
+// The cursor acts as a magnet — DOM elements are attracted or repelled.
+// No elements are removed. Layout deforms smoothly and springs back.
+// A 3D horseshoe magnet follows the cursor.
+//
+// Controls:
+//   Strength    pull/push force
+//   Radius      area of influence
+//   Smoothing   easing speed
+//   Mode        attract / repel`,
+  },
 };
 
 const DEFAULT_PRESET = "blur";
@@ -171,6 +184,15 @@ const bhSpeedEl = $("bh_speed");
 const bhSpeedValueEl = $("bh_speed_value");
 const bhSpinEl = $("bh_spin");
 const bhSpinValueEl = $("bh_spin_value");
+const mgControlsEl = $("magnetic_controls");
+const mgStrengthEl = $("mg_strength");
+const mgStrengthValueEl = $("mg_strength_value");
+const mgRadiusEl = $("mg_radius");
+const mgRadiusValueEl = $("mg_radius_value");
+const mgSmoothingEl = $("mg_smoothing");
+const mgSmoothingValueEl = $("mg_smoothing_value");
+const mgModeEl = $("mg_mode");
+const mgModeValueEl = $("mg_mode_value");
 const fbControlsEl = $("fireburn_controls");
 const fbIntensityEl = $("fb_intensity");
 const fbIntensityValueEl = $("fb_intensity_value");
@@ -361,6 +383,7 @@ function syncPresetUi() {
   rollControlsEl.hidden = preset.kind !== "roll";
   bhControlsEl.hidden = preset.kind !== "blackhole";
   fbControlsEl.hidden = preset.kind !== "fireburn";
+  mgControlsEl.hidden = preset.kind !== "magnetic";
   if (preset.kind === "roll") {
     presetHintEl.innerHTML =
       "Requires <code>chrome://flags/#canvas-draw-element</code>. This preset uses a built-in WebGL mesh pass with live <code>uProgress</code> control.";
@@ -370,6 +393,9 @@ function syncPresetUi() {
   } else if (preset.kind === "fireburn") {
     presetHintEl.innerHTML =
       "Click and drag to shoot fire. Elements burn progressively and disintegrate. Adjust <code>intensity</code>, <code>radius</code>, <code>burn speed</code>, <code>particles</code> below.";
+  } else if (preset.kind === "magnetic") {
+    presetHintEl.innerHTML =
+      "Cursor acts as a magnet. Elements are attracted or repelled smoothly. Adjust <code>strength</code>, <code>radius</code>, <code>smoothing</code>, and toggle <code>attract/repel</code> below.";
   } else {
     presetHintEl.innerHTML =
       "Requires <code>chrome://flags/#canvas-draw-element</code>. Fragment presets expose <code>uTex</code>, <code>uTime</code>, <code>uResolution</code>, <code>vUv</code>.";
@@ -395,6 +421,15 @@ function getFbValues() {
   };
 }
 
+function getMgValues() {
+  return {
+    mgStrength: clamp01(Number(mgStrengthEl.value)),
+    mgRadius: clamp01(Number(mgRadiusEl.value)),
+    mgSmoothing: clamp01(Number(mgSmoothingEl.value)),
+    mgMode: mgModeEl.value === "repel" ? "repel" : "attract",
+  };
+}
+
 function buildApplyConfig() {
   const preset = getPreset();
   return {
@@ -403,6 +438,7 @@ function buildApplyConfig() {
     rollProgress: getRollProgress(),
     ...getBhValues(),
     ...getFbValues(),
+    ...getMgValues(),
   };
 }
 
@@ -497,6 +533,31 @@ for (const el of [fbIntensityEl, fbRadiusEl, fbBurnspeedEl, fbParticlesEl]) {
   });
 }
 syncFbLabels();
+
+function syncMgLabels() {
+  mgStrengthValueEl.textContent = clamp01(Number(mgStrengthEl.value)).toFixed(2);
+  mgRadiusValueEl.textContent = clamp01(Number(mgRadiusEl.value)).toFixed(2);
+  mgSmoothingValueEl.textContent = clamp01(Number(mgSmoothingEl.value)).toFixed(2);
+  mgModeValueEl.textContent = mgModeEl.value;
+}
+
+for (const el of [mgStrengthEl, mgRadiusEl, mgSmoothingEl, mgModeEl]) {
+  el.addEventListener(el.tagName === "SELECT" ? "change" : "input", async () => {
+    syncMgLabels();
+    if (
+      getPreset().kind !== "magnetic" ||
+      appState.appliedEngine !== "magnetic"
+    )
+      return;
+    try {
+      await inject(updateShaderConfigInPage, [getMgValues()]);
+      setStatus("");
+    } catch (e) {
+      setStatus(String(e));
+    }
+  });
+}
+syncMgLabels();
 
 async function inject(func, args = []) {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -1634,6 +1695,549 @@ void main() {
     };
   }
 
+  // ── Magnetic Field DOM engine ───────────────────────────────────
+  // Hover-driven. Elements attracted → captured → reparented to body
+  // as position:fixed so they follow the cursor freely across the
+  // entire viewport. Press Space to release (spring back to origin).
+  function createMagneticFieldEngine(config) {
+    const state = {
+      cursorX: -9999,
+      cursorY: -9999,
+      smoothX: -9999,
+      smoothY: -9999,
+      active: false,
+      strength: clampUnit(Number(config.mgStrength ?? 0.5)),
+      radius: clampUnit(Number(config.mgRadius ?? 0.5)),
+      smoothing: clampUnit(Number(config.mgSmoothing ?? 0.5)),
+      mode: config.mgMode === "repel" ? -1 : 1,
+      pulseIntensity: 0,
+      captureCount: 0,
+      vibePhase: 0,
+    };
+
+    const getRadiusPx = () => 80 + state.radius * 350;
+    const CAPTURE_THRESHOLD = 0.35;
+
+    // Per-element data. Captured elements store DOM origin for release.
+    //   origParent, origNext: where to put it back on release
+    //   origStyles: snapshot of position/top/left/width/height/margin/zIndex/pointerEvents/transform/transition
+    //   followX, followY: smoothed absolute viewport position
+    const tracked = new Map();
+    let captureOrder = 0;
+
+    const SKIP_SELECTOR = "[id^='__html_shader']";
+
+    function getTargetElements() {
+      const all = document.body.querySelectorAll(
+        "h1,h2,h3,h4,h5,h6,p,a,button,img,li,span," +
+          "div,section,nav,article,header,footer,ul,ol," +
+          "input,textarea,select,label,code,pre,blockquote," +
+          "table,tr,td,th,figure,figcaption,svg",
+      );
+      const results = [];
+      for (const el of all) {
+        if (el.closest(SKIP_SELECTOR)) continue;
+        if (el.dataset.__mgCaptured) continue; // skip already-captured
+        const hasChild = el.querySelector(
+          "h1,h2,h3,p,a,button,img,li,span,code,pre",
+        );
+        if (!hasChild || el.tagName === "LI" || el.tagName === "A") {
+          results.push(el);
+        }
+      }
+      return results;
+    }
+
+    function ensureTracked(el, rect) {
+      if (tracked.has(el)) return tracked.get(el);
+      const d = {
+        status: "free",
+        tx: 0, ty: 0, vx: 0, vy: 0,
+        rot: 0, scale: 1,
+        captureIndex: 0,
+        captureOffX: 0, captureOffY: 0,
+        followX: 0, followY: 0,
+        // DOM restore info (filled on capture)
+        origParent: null, origNext: null,
+        origStyles: null,
+        origW: 0, origH: 0,
+        // Original position in page for release animation target
+        releaseTargetX: 0, releaseTargetY: 0,
+      };
+      tracked.set(el, d);
+      return d;
+    }
+
+    function stackOffset(index, total) {
+      if (total <= 1) return { x: 0, y: 0 };
+      const angle = (index / Math.max(total, 1)) * Math.PI * 2 +
+                    Math.sin(index * 1.7) * 0.5;
+      const ring = 15 + Math.min(total, 12) * 4;
+      return { x: Math.cos(angle) * ring, y: Math.sin(angle) * ring };
+    }
+
+    // ── Capture: reparent to body, position:fixed ──
+    function captureElement(el, d, rect) {
+      // Save DOM position for release
+      d.origParent = el.parentNode;
+      d.origNext = el.nextSibling;
+      d.origW = rect.width;
+      d.origH = rect.height;
+
+      // Snapshot inline styles we'll overwrite
+      const s = el.style;
+      d.origStyles = {
+        position: s.position, top: s.top, left: s.left,
+        width: s.width, height: s.height,
+        margin: s.margin, zIndex: s.zIndex,
+        pointerEvents: s.pointerEvents,
+        transform: s.transform, transition: s.transition,
+        boxSizing: s.boxSizing,
+      };
+
+      // Set initial fixed position to current viewport rect (no visual jump)
+      const hw = rect.width / 2;
+      const hh = rect.height / 2;
+
+      // Reparent to body
+      document.body.appendChild(el);
+      el.dataset.__mgCaptured = "1";
+
+      // Make position:fixed at element's current viewport location
+      Object.assign(el.style, {
+        position: "fixed",
+        top: "0px",
+        left: "0px",
+        width: rect.width + "px",
+        height: rect.height + "px",
+        margin: "0",
+        boxSizing: "border-box",
+        pointerEvents: "none",
+        transition: "none",
+        zIndex: String(10000 + d.captureIndex),
+      });
+
+      // Initialize follow position to current center
+      d.followX = rect.left + hw;
+      d.followY = rect.top + hh;
+
+      // Set transform so element appears exactly where it was
+      el.style.transform =
+        `translate(${(d.followX - hw).toFixed(2)}px, ${(d.followY - hh).toFixed(2)}px)`;
+    }
+
+    // ── Release: reparent back, restore styles ──
+    function releaseElement(el, d) {
+      delete el.dataset.__mgCaptured;
+
+      // Calculate where the element needs to go back
+      // (we'll animate it to the original DOM position)
+      if (d.origParent && d.origParent.isConnected) {
+        if (d.origNext && d.origNext.parentNode === d.origParent) {
+          d.origParent.insertBefore(el, d.origNext);
+        } else {
+          d.origParent.appendChild(el);
+        }
+      }
+
+      // Restore original styles
+      if (d.origStyles) {
+        const os = d.origStyles;
+        el.style.position = os.position;
+        el.style.top = os.top;
+        el.style.left = os.left;
+        el.style.width = os.width;
+        el.style.height = os.height;
+        el.style.margin = os.margin;
+        el.style.boxSizing = os.boxSizing;
+        el.style.pointerEvents = os.pointerEvents;
+        el.style.zIndex = os.zIndex;
+      }
+
+      // Animate return with a smooth transition
+      el.style.transition = "transform 0.5s cubic-bezier(0.22, 1, 0.36, 1)";
+      el.style.transform = "";
+
+      setTimeout(() => {
+        el.style.transition = d.origStyles ? d.origStyles.transition : "";
+      }, 550);
+
+      d.status = "free";
+      d.tx = 0; d.ty = 0; d.vx = 0; d.vy = 0;
+      d.rot = 0; d.scale = 1;
+      d.origParent = null; d.origNext = null; d.origStyles = null;
+    }
+
+    function releaseAll() {
+      for (const [el, d] of tracked) {
+        if (d.status === "captured") {
+          releaseElement(el, d);
+        }
+      }
+      captureOrder = 0;
+      state.captureCount = 0;
+    }
+
+    let running = true;
+    let raf = 0;
+    let lastTime = performance.now();
+
+    function tick() {
+      if (!running) return;
+      const now = performance.now();
+      const dt = Math.min((now - lastTime) / 1000, 0.05);
+      lastTime = now;
+
+      const lerpRate = 0.08 + state.smoothing * 0.2;
+      if (state.active && state.cursorX > -999) {
+        state.smoothX += (state.cursorX - state.smoothX) * lerpRate;
+        state.smoothY += (state.cursorY - state.smoothY) * lerpRate;
+      }
+
+      const cx = state.smoothX;
+      const cy = state.smoothY;
+      const radiusPx = getRadiusPx();
+      const captureRadiusPx = radiusPx * CAPTURE_THRESHOLD;
+      const isOnPage = cx > -999 && state.active;
+      const isAttract = state.mode > 0;
+
+      state.pulseIntensity *= 0.92;
+      state.vibePhase += dt * 20;
+
+      // Count captured and recompute stacking
+      let capturedCount = 0;
+      let stackIdx = 0;
+      for (const [, d] of tracked) {
+        if (d.status === "captured") {
+          capturedCount++;
+          const off = stackOffset(stackIdx, capturedCount);
+          d.captureOffX = off.x;
+          d.captureOffY = off.y;
+          stackIdx++;
+        }
+      }
+      // Fix: recompute after we know total
+      if (stackIdx !== capturedCount) {
+        stackIdx = 0;
+        for (const [, d] of tracked) {
+          if (d.status === "captured") {
+            const off = stackOffset(stackIdx, capturedCount);
+            d.captureOffX = off.x;
+            d.captureOffY = off.y;
+            stackIdx++;
+          }
+        }
+      }
+      state.captureCount = capturedCount;
+
+      // ── Process captured elements (they are now position:fixed in body) ──
+      for (const [el, d] of tracked) {
+        if (d.status !== "captured") continue;
+
+        const hw = d.origW / 2;
+        const hh = d.origH / 2;
+
+        // Target = cursor + stack offset
+        const targetX = cx + d.captureOffX;
+        const targetY = cy + d.captureOffY;
+
+        // Inertia-based follow with per-element lag
+        const followLag = 0.12 + d.captureIndex * 0.015;
+        const lr = Math.min(followLag + state.smoothing * 0.15, 0.5);
+        d.followX += (targetX - d.followX) * lr;
+        d.followY += (targetY - d.followY) * lr;
+
+        // Vibration
+        const vibeAmp = Math.min(capturedCount * 0.15, 2.0);
+        const vibeX = Math.sin(state.vibePhase + d.captureIndex * 2.1) * vibeAmp;
+        const vibeY = Math.cos(state.vibePhase * 1.3 + d.captureIndex * 1.7) * vibeAmp;
+
+        // Rotation + scale
+        const targetRot = Math.sin(now * 0.002 + d.captureIndex * 1.5) * 3;
+        d.rot += (targetRot - d.rot) * 0.08;
+        const targetScale = 0.92 + Math.sin(now * 0.003 + d.captureIndex) * 0.03;
+        d.scale += (targetScale - d.scale) * 0.1;
+
+        // Position via transform (element is fixed at 0,0)
+        const px = d.followX + vibeX - hw;
+        const py = d.followY + vibeY - hh;
+
+        el.style.transform =
+          `translate(${px.toFixed(1)}px, ${py.toFixed(1)}px) ` +
+          `rotate(${d.rot.toFixed(2)}deg) scale(${d.scale.toFixed(4)})`;
+        el.style.zIndex = String(10000 + d.captureIndex);
+      }
+
+      // ── Process free/attracting elements (still in normal DOM flow) ──
+      const elements = getTargetElements();
+      for (const el of elements) {
+        const rect = el.getBoundingClientRect();
+        const d = ensureTracked(el, rect);
+        if (d.status === "captured") continue;
+
+        const elCx = rect.left + rect.width / 2;
+        const elCy = rect.top + rect.height / 2;
+
+        let targetTx = 0;
+        let targetTy = 0;
+        let targetRot = 0;
+        let targetScale = 1;
+
+        if (isOnPage) {
+          const dx = cx - elCx;
+          const dy = cy - elCy;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+
+          if (dist < radiusPx && dist > 1) {
+            const norm = 1 - dist / radiusPx;
+            const influence = norm * norm;
+            const maxDisplace = 60 * state.strength;
+            const dirX = dx / dist;
+            const dirY = dy / dist;
+
+            targetTx = dirX * influence * maxDisplace * state.mode;
+            targetTy = dirY * influence * maxDisplace * state.mode;
+            targetRot = (dirX * 0.5 - dirY * 0.3) * influence * 8 * state.mode;
+            targetScale = 1 + influence * 0.08 * state.mode;
+
+            d.status = "attracting";
+
+            // ── CAPTURE if close enough ──
+            if (isAttract && dist < captureRadiusPx) {
+              d.status = "captured";
+              d.captureIndex = captureOrder++;
+              captureElement(el, d, rect);
+              state.captureCount++;
+              state.pulseIntensity = Math.min(state.pulseIntensity + 0.5, 1);
+              continue;
+            }
+          } else {
+            if (d.status === "attracting") d.status = "free";
+          }
+        } else {
+          if (d.status === "attracting") d.status = "free";
+        }
+
+        // Spring physics for free/attracting
+        const springK = 4 + state.smoothing * 8;
+        const damping = 0.15 + state.smoothing * 0.1;
+        const ax = (targetTx - d.tx) * springK;
+        const ay = (targetTy - d.ty) * springK;
+        d.vx = (d.vx + ax * dt) * (1 - damping);
+        d.vy = (d.vy + ay * dt) * (1 - damping);
+        d.tx += d.vx * dt * 60;
+        d.ty += d.vy * dt * 60;
+        d.rot += (targetRot - d.rot) * Math.min(springK * dt, 0.3);
+        d.scale += (targetScale - d.scale) * Math.min(springK * dt, 0.3);
+
+        const moving = Math.abs(d.tx) > 0.1 || Math.abs(d.ty) > 0.1 ||
+                        Math.abs(d.rot) > 0.05 || Math.abs(d.scale - 1) > 0.001;
+
+        if (moving) {
+          el.style.transition = "none";
+          el.style.transform =
+            `translate(${d.tx.toFixed(2)}px, ${d.ty.toFixed(2)}px) ` +
+            `rotate(${d.rot.toFixed(2)}deg) scale(${d.scale.toFixed(4)})`;
+          el.style.zIndex = Math.abs(d.tx) + Math.abs(d.ty) > 10 ? "1" : "";
+        } else if (d.status === "free" &&
+                   Math.abs(d.tx) < 0.05 && Math.abs(d.ty) < 0.05) {
+          el.style.transform = "";
+          el.style.zIndex = "";
+        }
+      }
+
+      raf = requestAnimationFrame(tick);
+    }
+
+    return {
+      state,
+      releaseAll,
+      start() {
+        running = true;
+        lastTime = performance.now();
+        tick();
+      },
+      update(nextConfig) {
+        if ("mgStrength" in nextConfig)
+          state.strength = clampUnit(Number(nextConfig.mgStrength));
+        if ("mgRadius" in nextConfig)
+          state.radius = clampUnit(Number(nextConfig.mgRadius));
+        if ("mgSmoothing" in nextConfig)
+          state.smoothing = clampUnit(Number(nextConfig.mgSmoothing));
+        if ("mgMode" in nextConfig)
+          state.mode = nextConfig.mgMode === "repel" ? -1 : 1;
+      },
+      destroy() {
+        running = false;
+        cancelAnimationFrame(raf);
+        // Release all captured elements back to their original parents
+        for (const [el, d] of tracked) {
+          if (d.status === "captured") {
+            releaseElement(el, d);
+          }
+          el.style.transform = "";
+          el.style.transition = "";
+          el.style.zIndex = "";
+          el.style.pointerEvents = "";
+        }
+        tracked.clear();
+      },
+    };
+  }
+
+  // ── Three.js horseshoe magnet cursor ──────────────────────────
+  function createMagnetCursor() {
+    const container = document.createElement("canvas");
+    container.id = "__html_shader_mg_cursor__";
+    const size = 160;
+    container.width = size * (window.devicePixelRatio || 1);
+    container.height = size * (window.devicePixelRatio || 1);
+    Object.assign(container.style, {
+      position: "fixed",
+      width: size + "px",
+      height: size + "px",
+      pointerEvents: "none",
+      zIndex: "2147483647",
+      transform: "translate(-50%, -50%)",
+      top: "50%",
+      left: "50%",
+    });
+    document.body.appendChild(container);
+
+    let THREE = null;
+    let scene, camera, rendererTjs, magnetGroup;
+    let ready = false;
+    let prevMX = 0;
+    let prevMY = 0;
+    let tiltX = 0;
+    let tiltY = 0;
+
+    const script = document.createElement("script");
+    script.src =
+      "https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js";
+    script.onload = () => {
+      THREE = window.THREE;
+      initScene();
+    };
+    document.head.appendChild(script);
+
+    function initScene() {
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(40, 1, 0.1, 100);
+      camera.position.z = 4;
+
+      rendererTjs = new THREE.WebGLRenderer({
+        canvas: container, alpha: true, antialias: true,
+      });
+      rendererTjs.setSize(size, size);
+      rendererTjs.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+      rendererTjs.setClearColor(0x000000, 0);
+
+      magnetGroup = new THREE.Group();
+      scene.add(magnetGroup);
+
+      // ── Build horseshoe magnet from primitives ──
+
+      // U-shape body: curved torus segment
+      const bodyGeo = new THREE.TorusGeometry(0.6, 0.15, 16, 32, Math.PI);
+      const bodyMat = new THREE.MeshBasicMaterial({
+        color: 0x888888, transparent: true, opacity: 0.9,
+      });
+      const body = new THREE.Mesh(bodyGeo, bodyMat);
+      body.rotation.z = Math.PI; // open side down
+      magnetGroup.add(body);
+
+      // Red pole (left leg)
+      const redGeo = new THREE.CylinderGeometry(0.15, 0.15, 0.35, 16);
+      const redMat = new THREE.MeshBasicMaterial({ color: 0xdd3333 });
+      const redPole = new THREE.Mesh(redGeo, redMat);
+      redPole.position.set(-0.6, -0.17, 0);
+      magnetGroup.add(redPole);
+
+      // Blue pole (right leg)
+      const blueGeo = new THREE.CylinderGeometry(0.15, 0.15, 0.35, 16);
+      const blueMat = new THREE.MeshBasicMaterial({ color: 0x3355dd });
+      const bluePole = new THREE.Mesh(blueGeo, blueMat);
+      bluePole.position.set(0.6, -0.17, 0);
+      magnetGroup.add(bluePole);
+
+      // Glow ring (subtle halo)
+      const glowGeo = new THREE.TorusGeometry(0.85, 0.03, 8, 48, Math.PI);
+      const glowMat = new THREE.MeshBasicMaterial({
+        color: 0x6688ff, transparent: true, opacity: 0.3,
+      });
+      const glow = new THREE.Mesh(glowGeo, glowMat);
+      glow.rotation.z = Math.PI;
+      magnetGroup.add(glow);
+
+      // Field line particles around the poles
+      const pCount = 40;
+      const pGeo = new THREE.BufferGeometry();
+      const positions = new Float32Array(pCount * 3);
+      for (let i = 0; i < pCount; i++) {
+        const a = (i / pCount) * Math.PI;
+        const r = 0.7 + Math.random() * 0.4;
+        positions[i * 3] = Math.cos(a + Math.PI) * r;
+        positions[i * 3 + 1] = Math.sin(a + Math.PI) * r * 0.6 - 0.3;
+        positions[i * 3 + 2] = (Math.random() - 0.5) * 0.3;
+      }
+      pGeo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+      const pMat = new THREE.PointsMaterial({
+        color: 0x88aaff, size: 0.03, transparent: true, opacity: 0.5,
+      });
+      const fieldParticles = new THREE.Points(pGeo, pMat);
+      magnetGroup.add(fieldParticles);
+
+      ready = true;
+    }
+
+    return {
+      update(mouseX, mouseY, strength, mode, pulse, time, captureCount) {
+        container.style.left = mouseX + "px";
+        container.style.top = mouseY + "px";
+
+        // Scale with strength + pulse + captured element count
+        const captureBoost = Math.min((captureCount || 0) * 0.02, 0.3);
+        const s = 0.8 + strength * 0.3 + pulse * 0.2 + captureBoost;
+        container.style.width = size * s + "px";
+        container.style.height = size * s + "px";
+
+        if (!ready) return;
+
+        // Tilt based on mouse movement direction
+        const dmx = mouseX - prevMX;
+        const dmy = mouseY - prevMY;
+        prevMX = mouseX;
+        prevMY = mouseY;
+        tiltY += (dmx * 0.003 - tiltY) * 0.1;
+        tiltX += (-dmy * 0.003 - tiltX) * 0.1;
+
+        // Vibration when holding many elements
+        const vibeAmp = Math.min((captureCount || 0) * 0.005, 0.06);
+        const vibeX = Math.sin(time * 25) * vibeAmp;
+        const vibeY = Math.cos(time * 31) * vibeAmp;
+
+        magnetGroup.rotation.x = tiltX + Math.sin(time * 1.5) * 0.05 + vibeY;
+        magnetGroup.rotation.y = tiltY + vibeX;
+        magnetGroup.rotation.z = mode < 0 ? Math.PI : 0;
+
+        // Glow brightens with captures
+        if (magnetGroup.children[3]) {
+          magnetGroup.children[3].material.opacity =
+            0.3 + Math.min((captureCount || 0) * 0.05, 0.4) + pulse * 0.2;
+        }
+
+        rendererTjs.render(scene, camera);
+      },
+      destroy() {
+        if (rendererTjs) rendererTjs.dispose();
+        container.remove();
+        const s = document.querySelector('script[src*="three.min.js"]');
+        if (s) s.remove();
+      },
+    };
+  }
+
   // ── Three.js black hole cursor overlay ─────────────────────────
   function createBlackholeCursor(getState) {
     const container = document.createElement("canvas");
@@ -1774,7 +2378,7 @@ void main() {
 
   if (window.__htmlShaderStop) window.__htmlShaderStop();
 
-  const engineKinds = ["fragment", "roll", "blackhole", "fireburn"];
+  const engineKinds = ["fragment", "roll", "blackhole", "fireburn", "magnetic"];
   const config =
     typeof rawConfig === "string"
       ? { engine: "fragment", fragSrc: rawConfig, rollProgress: 1 }
@@ -1792,6 +2396,10 @@ void main() {
           fbRadius: clampUnit(Number(rawConfig?.fbRadius ?? 0.4)),
           fbBurnspeed: clampUnit(Number(rawConfig?.fbBurnspeed ?? 0.5)),
           fbParticles: clampUnit(Number(rawConfig?.fbParticles ?? 0.6)),
+          mgStrength: clampUnit(Number(rawConfig?.mgStrength ?? 0.5)),
+          mgRadius: clampUnit(Number(rawConfig?.mgRadius ?? 0.5)),
+          mgSmoothing: clampUnit(Number(rawConfig?.mgSmoothing ?? 0.5)),
+          mgMode: rawConfig?.mgMode === "repel" ? "repel" : "attract",
         };
 
   // ════════════════════════════════════════════════════════════════
@@ -1885,6 +2493,85 @@ void main() {
       document.documentElement.removeEventListener("mouseleave", onMouseLeave);
       engine.destroy();
       cursorStyle.remove();
+      delete window.__htmlShaderStop;
+      delete window.__htmlShaderUpdate;
+    };
+
+    window.__htmlShaderStop = stop;
+    window.__htmlShaderUpdate = (nextConfig) => {
+      if (!nextConfig) return;
+      engine.update(nextConfig);
+    };
+    return null;
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  // MAGNETIC FIELD — DOM-based engine (no WebGL, no drawElement)
+  // ════════════════════════════════════════════════════════════════
+  if (config.engine === "magnetic") {
+    const engine = createMagneticFieldEngine(config);
+    const mgCursor = createMagnetCursor();
+
+    const cursorStyle = document.createElement("style");
+    cursorStyle.id = "__html_shader_mg_style__";
+    cursorStyle.textContent = "* { cursor: none !important; }";
+    document.head.appendChild(cursorStyle);
+
+    const startTime = performance.now();
+
+    const onMouseMove = (e) => {
+      if (!engine.state.active) {
+        engine.state.active = true;
+        engine.state.smoothX = e.clientX;
+        engine.state.smoothY = e.clientY;
+      }
+      engine.state.cursorX = e.clientX;
+      engine.state.cursorY = e.clientY;
+    };
+    const onMouseLeave = () => {
+      engine.state.active = false;
+      engine.state.cursorX = -9999;
+      engine.state.cursorY = -9999;
+    };
+    // Space to release all captured elements
+    const onKeyDown = (e) => {
+      if (e.code === "Space") {
+        e.preventDefault();
+        engine.releaseAll();
+      }
+    };
+    addEventListener("mousemove", onMouseMove);
+    addEventListener("keydown", onKeyDown);
+    document.documentElement.addEventListener("mouseleave", onMouseLeave);
+
+    engine.start();
+
+    const mgFrame = () => {
+      if (!engine.state) return;
+      mgCursor.update(
+        engine.state.smoothX,
+        engine.state.smoothY,
+        engine.state.strength,
+        engine.state.mode,
+        engine.state.pulseIntensity,
+        (performance.now() - startTime) / 1000,
+        engine.state.captureCount,
+      );
+      requestAnimationFrame(mgFrame);
+    };
+    requestAnimationFrame(mgFrame);
+
+    const stop = () => {
+      removeEventListener("mousemove", onMouseMove);
+      removeEventListener("keydown", onKeyDown);
+      document.documentElement.removeEventListener("mouseleave", onMouseLeave);
+      engine.releaseAll();
+      // Wait a frame for release springs to start, then destroy
+      setTimeout(() => {
+        engine.destroy();
+        mgCursor.destroy();
+        cursorStyle.remove();
+      }, 50);
       delete window.__htmlShaderStop;
       delete window.__htmlShaderUpdate;
     };
