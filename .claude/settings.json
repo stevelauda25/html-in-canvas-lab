@@ -9,7 +9,13 @@
       "Bash(cp -r html-in-canvas-lab/src .)",
       "Bash(cp -r html-in-canvas-lab/public .)",
       "Bash(cp -r html-in-canvas-lab/node_modules .)",
-      "Bash(npm install:*)"
+      "Bash(npm install:*)",
+      "Bash(npx tsc:*)",
+      "Bash(npx vite:*)",
+      "Bash(rm -rf src/ reference/ dist/ docs/ public/ node_modules/ html-in-canvas-lab/)",
+      "Bash(rm -f index.html package.json package-lock.json tsconfig.json CLAUDE.md)",
+      "Bash(node -c extension/popup.js)",
+      "Bash(python -c \"import html.parser; html.parser.HTMLParser\\(\\).feed\\(open\\('extension/popup.html'\\).read\\(\\)\\); print\\('HTML OK'\\)\")"
     ],
     "additionalDirectories": [
       "d:\\Blissful\\Design Engineering\\html-in-canvas-lab\\html-in-canvas-lab"

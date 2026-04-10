@@ -120,6 +120,22 @@ void main() {
 //   uRadius    outer curl radius
 //   uThickness spiral thickness per turn`,
   },
+  blackhole: {
+    kind: "blackhole",
+    source: `// Built-in Black Hole preset.
+// The cursor acts as a gravitational singularity.
+// The page is pulled toward it with radial distortion and spiral twist.
+// A 3D black hole with accretion ring follows the cursor.
+//
+// Engine uniforms:
+//   uCursor     cursor position in UV space
+//   uStrength   gravitational pull intensity
+//   uRadius     area of influence
+//   uSpin       spiral/vortex twist amount
+//   uTex        live drawElement() page snapshot
+//   uTime       elapsed time
+//   uResolution viewport size in device pixels`,
+  },
 };
 
 const DEFAULT_PRESET = "blur";
@@ -133,6 +149,15 @@ const presetHintEl = $("preset_hint");
 const rollControlsEl = $("roll_controls");
 const rollProgressEl = $("roll_progress");
 const rollProgressValueEl = $("roll_progress_value");
+const bhControlsEl = $("blackhole_controls");
+const bhStrengthEl = $("bh_strength");
+const bhStrengthValueEl = $("bh_strength_value");
+const bhRadiusEl = $("bh_radius");
+const bhRadiusValueEl = $("bh_radius_value");
+const bhSpeedEl = $("bh_speed");
+const bhSpeedValueEl = $("bh_speed_value");
+const bhSpinEl = $("bh_spin");
+const bhSpinValueEl = $("bh_spin_value");
 const editorEl = document.querySelector(".editor");
 const hlEl = document.querySelector("#shader-hl code");
 
@@ -312,11 +337,27 @@ function syncPresetUi() {
   shaderEl.readOnly = preset.kind !== "fragment";
   editorEl.classList.toggle("is-readonly", preset.kind !== "fragment");
   rollControlsEl.hidden = preset.kind !== "roll";
-  presetHintEl.innerHTML =
-    preset.kind === "roll"
-      ? "Requires <code>chrome://flags/#canvas-draw-element</code>. This preset uses a built-in WebGL mesh pass with live <code>uProgress</code> control."
-      : "Requires <code>chrome://flags/#canvas-draw-element</code>. Fragment presets expose <code>uTex</code>, <code>uTime</code>, <code>uResolution</code>, <code>vUv</code>.";
+  bhControlsEl.hidden = preset.kind !== "blackhole";
+  if (preset.kind === "roll") {
+    presetHintEl.innerHTML =
+      "Requires <code>chrome://flags/#canvas-draw-element</code>. This preset uses a built-in WebGL mesh pass with live <code>uProgress</code> control.";
+  } else if (preset.kind === "blackhole") {
+    presetHintEl.innerHTML =
+      "Requires <code>chrome://flags/#canvas-draw-element</code>. Cursor becomes a gravitational singularity. Adjust <code>strength</code>, <code>radius</code>, <code>speed</code>, <code>spin</code> below.";
+  } else {
+    presetHintEl.innerHTML =
+      "Requires <code>chrome://flags/#canvas-draw-element</code>. Fragment presets expose <code>uTex</code>, <code>uTime</code>, <code>uResolution</code>, <code>vUv</code>.";
+  }
   syncHighlight();
+}
+
+function getBhValues() {
+  return {
+    strength: clamp01(Number(bhStrengthEl.value)),
+    radius: clamp01(Number(bhRadiusEl.value)),
+    speed: clamp01(Number(bhSpeedEl.value)),
+    spin: clamp01(Number(bhSpinEl.value)),
+  };
 }
 
 function buildApplyConfig() {
@@ -325,6 +366,7 @@ function buildApplyConfig() {
     engine: preset.kind,
     fragSrc: shaderEl.value,
     rollProgress: getRollProgress(),
+    ...getBhValues(),
   };
 }
 
@@ -369,6 +411,31 @@ rollProgressEl.addEventListener("input", async () => {
     setStatus(String(e));
   }
 });
+
+function syncBhLabels() {
+  bhStrengthValueEl.textContent = clamp01(Number(bhStrengthEl.value)).toFixed(2);
+  bhRadiusValueEl.textContent = clamp01(Number(bhRadiusEl.value)).toFixed(2);
+  bhSpeedValueEl.textContent = clamp01(Number(bhSpeedEl.value)).toFixed(2);
+  bhSpinValueEl.textContent = clamp01(Number(bhSpinEl.value)).toFixed(2);
+}
+
+for (const el of [bhStrengthEl, bhRadiusEl, bhSpeedEl, bhSpinEl]) {
+  el.addEventListener("input", async () => {
+    syncBhLabels();
+    if (
+      getPreset().kind !== "blackhole" ||
+      appState.appliedEngine !== "blackhole"
+    )
+      return;
+    try {
+      await inject(updateShaderConfigInPage, [getBhValues()]);
+      setStatus("");
+    } catch (e) {
+      setStatus(String(e));
+    }
+  });
+}
+syncBhLabels();
 
 async function inject(func, args = []) {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -781,17 +848,490 @@ void main() {
     };
   }
 
+  // ── Black Hole DOM engine ───────────────────────────────────────
+  // No WebGL. Manipulates individual DOM elements toward the cursor.
+  function createBlackholeEngine(config) {
+    const state = {
+      cursorX: innerWidth / 2,
+      cursorY: innerHeight / 2,
+      smoothX: innerWidth / 2,
+      smoothY: innerHeight / 2,
+      strength: clampUnit(Number(config.strength ?? 0.5)),
+      radius: clampUnit(Number(config.radius ?? 0.4)),
+      speed: clampUnit(Number(config.speed ?? 0.5)),
+      spin: clampUnit(Number(config.spin ?? 0.3)),
+      glowPulse: 0,
+    };
+
+    // Radius in pixels (mapped from 0-1 to 100-800px)
+    const getRadiusPx = () => 100 + state.radius * 700;
+
+    // Track which elements are being affected
+    const tracked = new Map(); // element → { origRect, progress, rotation }
+    const absorbed = new Set();
+
+    // Particle burst canvas overlay
+    const particleCanvas = document.createElement("canvas");
+    particleCanvas.id = "__html_shader_bh_particles__";
+    Object.assign(particleCanvas.style, {
+      position: "fixed",
+      inset: "0",
+      width: "100vw",
+      height: "100vh",
+      pointerEvents: "none",
+      zIndex: "2147483646",
+    });
+    const pDpr = Math.min(window.devicePixelRatio || 1, 2);
+    particleCanvas.width = Math.floor(innerWidth * pDpr);
+    particleCanvas.height = Math.floor(innerHeight * pDpr);
+    document.body.appendChild(particleCanvas);
+    const pCtx = particleCanvas.getContext("2d");
+    pCtx.scale(pDpr, pDpr);
+
+    const particles = []; // { x, y, vx, vy, life, maxLife, size, hue }
+
+    function spawnBurst(x, y, count) {
+      for (let i = 0; i < count; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const speed = 60 + Math.random() * 200;
+        const life = 0.4 + Math.random() * 0.6;
+        particles.push({
+          x,
+          y,
+          vx: Math.cos(angle) * speed,
+          vy: Math.sin(angle) * speed,
+          life,
+          maxLife: life,
+          size: 2 + Math.random() * 4,
+          hue: 20 + Math.random() * 30, // orange-yellow
+        });
+      }
+      // Trigger glow pulse
+      state.glowPulse = 1.0;
+    }
+
+    function shakeScreen() {
+      const intensity = 6;
+      const dur = 300;
+      const start = performance.now();
+      const orig = document.body.style.transform;
+      function tick() {
+        const t = (performance.now() - start) / dur;
+        if (t >= 1) {
+          document.body.style.transform = orig;
+          return;
+        }
+        const decay = 1 - t;
+        const ox = (Math.random() - 0.5) * 2 * intensity * decay;
+        const oy = (Math.random() - 0.5) * 2 * intensity * decay;
+        document.body.style.transform = `translate(${ox}px, ${oy}px)`;
+        requestAnimationFrame(tick);
+      }
+      requestAnimationFrame(tick);
+    }
+
+    // Collect targetable elements (skip our own injected elements)
+    const SKIP_IDS = new Set([
+      "__html_shader_bh_cursor__",
+      "__html_shader_bh_particles__",
+    ]);
+    function getTargetElements() {
+      const all = document.body.querySelectorAll(
+        "h1, h2, h3, h4, h5, h6, p, a, button, img, li, span, " +
+          "div, section, nav, article, header, footer, ul, ol, " +
+          "input, textarea, select, label, code, pre, blockquote, " +
+          "table, tr, td, th, figure, figcaption, svg",
+      );
+      const results = [];
+      for (const el of all) {
+        if (SKIP_IDS.has(el.id)) continue;
+        if (el.closest("[id^='__html_shader']")) continue;
+        // Only target leaf-ish elements (no deep nesting of other targets)
+        const hasTargetChild = el.querySelector(
+          "h1,h2,h3,p,a,button,img,li,span,code,pre",
+        );
+        if (!hasTargetChild || el.tagName === "LI" || el.tagName === "A") {
+          results.push(el);
+        }
+      }
+      return results;
+    }
+
+    let raf = 0;
+    let running = true;
+    let lastTime = performance.now();
+
+    function tick() {
+      if (!running) return;
+      const now = performance.now();
+      const dt = Math.min((now - lastTime) / 1000, 0.05);
+      lastTime = now;
+
+      // Smooth cursor
+      const lerpRate = 0.05 + state.speed * 0.25;
+      state.smoothX += (state.cursorX - state.smoothX) * lerpRate;
+      state.smoothY += (state.cursorY - state.smoothY) * lerpRate;
+
+      const cx = state.smoothX;
+      const cy = state.smoothY;
+      const radiusPx = getRadiusPx();
+      const pullStrength = state.strength;
+      const spinAmount = state.spin;
+
+      // Process DOM elements
+      const elements = getTargetElements();
+      for (const el of elements) {
+        if (absorbed.has(el)) continue;
+
+        const rect = el.getBoundingClientRect();
+        const elCx = rect.left + rect.width / 2;
+        const elCy = rect.top + rect.height / 2;
+        const dx = cx - elCx;
+        const dy = cy - elCy;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+
+        if (dist > radiusPx) {
+          // Outside radius — reset if was tracked
+          if (tracked.has(el)) {
+            el.style.transform = "";
+            el.style.opacity = "";
+            el.style.transition = "transform 0.4s ease-out, opacity 0.4s ease-out";
+            tracked.delete(el);
+            // Clean transition after reset
+            setTimeout(() => {
+              if (!tracked.has(el)) el.style.transition = "";
+            }, 400);
+          }
+          continue;
+        }
+
+        // Inside radius — apply gravity
+        if (!tracked.has(el)) {
+          tracked.set(el, { progress: 0, rotation: 0 });
+        }
+        const data = tracked.get(el);
+
+        // Influence: 0 at edge, 1 at center (quadratic)
+        const norm = 1 - dist / radiusPx;
+        const influence = norm * norm;
+
+        // Progress accumulates — once pulled, keeps going
+        const pullSpeed = influence * pullStrength * 2.0;
+        data.progress = Math.min(data.progress + pullSpeed * dt, 1);
+
+        // Rotation accumulates with spin
+        data.rotation += spinAmount * influence * 180 * dt;
+
+        const p = data.progress;
+        // Ease-in curve for acceleration toward center
+        const eased = p * p * p;
+
+        const tx = dx * eased;
+        const ty = dy * eased;
+        const scale = 1 - eased * 0.8; // shrink to 0.2
+        const opacity = 1 - eased;
+        const rot = data.rotation * eased;
+
+        el.style.transition = "none";
+        el.style.transform = `translate(${tx}px, ${ty}px) scale(${scale}) rotate(${rot}deg)`;
+        el.style.opacity = String(Math.max(opacity, 0));
+
+        // Absorbed — element reached singularity
+        if (p >= 0.95 && opacity <= 0.1) {
+          absorbed.add(el);
+          tracked.delete(el);
+          el.style.visibility = "hidden";
+          el.style.transform = "";
+          el.style.opacity = "";
+          // Particle burst at absorption point
+          spawnBurst(cx, cy, 20 + Math.floor(Math.random() * 15));
+          shakeScreen();
+        }
+      }
+
+      // ── Render particles ──
+      pCtx.save();
+      pCtx.setTransform(1, 0, 0, 1, 0, 0);
+      pCtx.clearRect(0, 0, particleCanvas.width, particleCanvas.height);
+      pCtx.restore();
+
+      for (let i = particles.length - 1; i >= 0; i--) {
+        const pt = particles[i];
+        pt.life -= dt;
+        if (pt.life <= 0) {
+          particles.splice(i, 1);
+          continue;
+        }
+        pt.x += pt.vx * dt;
+        pt.y += pt.vy * dt;
+        pt.vx *= 0.96;
+        pt.vy *= 0.96;
+        const t = pt.life / pt.maxLife;
+        const alpha = t * 0.9;
+        pCtx.beginPath();
+        pCtx.arc(pt.x, pt.y, pt.size * t, 0, Math.PI * 2);
+        pCtx.fillStyle = `hsla(${pt.hue}, 100%, 60%, ${alpha})`;
+        pCtx.fill();
+      }
+
+      // Decay glow pulse
+      state.glowPulse *= 0.92;
+
+      raf = requestAnimationFrame(tick);
+    }
+
+    return {
+      state,
+      start() {
+        running = true;
+        lastTime = performance.now();
+        tick();
+      },
+      update(nextConfig) {
+        if ("strength" in nextConfig)
+          state.strength = clampUnit(Number(nextConfig.strength));
+        if ("radius" in nextConfig)
+          state.radius = clampUnit(Number(nextConfig.radius));
+        if ("speed" in nextConfig)
+          state.speed = clampUnit(Number(nextConfig.speed));
+        if ("spin" in nextConfig)
+          state.spin = clampUnit(Number(nextConfig.spin));
+      },
+      destroy() {
+        running = false;
+        cancelAnimationFrame(raf);
+        // Reset all tracked elements
+        for (const [el] of tracked) {
+          el.style.transform = "";
+          el.style.opacity = "";
+          el.style.transition = "";
+        }
+        tracked.clear();
+        // Restore absorbed elements
+        for (const el of absorbed) {
+          el.style.visibility = "";
+          el.style.transform = "";
+          el.style.opacity = "";
+        }
+        absorbed.clear();
+        particleCanvas.remove();
+      },
+    };
+  }
+
+  // ── Three.js black hole cursor overlay ─────────────────────────
+  function createBlackholeCursor(getState) {
+    const container = document.createElement("canvas");
+    container.id = "__html_shader_bh_cursor__";
+    const size = 200;
+    container.width = size * (window.devicePixelRatio || 1);
+    container.height = size * (window.devicePixelRatio || 1);
+    Object.assign(container.style, {
+      position: "fixed",
+      width: size + "px",
+      height: size + "px",
+      pointerEvents: "none",
+      zIndex: "2147483647",
+      transform: "translate(-50%, -50%)",
+      top: "50%",
+      left: "50%",
+    });
+    document.body.appendChild(container);
+
+    let THREE = null;
+    let scene, camera, rendererTjs, ring, core, particles;
+    let ready = false;
+
+    // Load Three.js from CDN
+    const script = document.createElement("script");
+    script.src =
+      "https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js";
+    script.onload = () => {
+      THREE = window.THREE;
+      initScene();
+    };
+    document.head.appendChild(script);
+
+    function initScene() {
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
+      camera.position.z = 3;
+
+      rendererTjs = new THREE.WebGLRenderer({
+        canvas: container,
+        alpha: true,
+        antialias: true,
+      });
+      rendererTjs.setSize(size, size);
+      rendererTjs.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+      rendererTjs.setClearColor(0x000000, 0);
+
+      // Event horizon — dark sphere
+      const coreGeo = new THREE.SphereGeometry(0.35, 32, 32);
+      const coreMat = new THREE.MeshBasicMaterial({ color: 0x000000 });
+      core = new THREE.Mesh(coreGeo, coreMat);
+      scene.add(core);
+
+      // Accretion ring — torus
+      const ringGeo = new THREE.TorusGeometry(0.7, 0.06, 16, 64);
+      const ringMat = new THREE.MeshBasicMaterial({
+        color: 0xff8833,
+        transparent: true,
+        opacity: 0.85,
+      });
+      ring = new THREE.Mesh(ringGeo, ringMat);
+      ring.rotation.x = Math.PI * 0.45;
+      scene.add(ring);
+
+      // Outer glow ring
+      const glowGeo = new THREE.TorusGeometry(0.85, 0.03, 12, 64);
+      const glowMat = new THREE.MeshBasicMaterial({
+        color: 0x4488ff,
+        transparent: true,
+        opacity: 0.4,
+      });
+      const glow = new THREE.Mesh(glowGeo, glowMat);
+      glow.rotation.x = Math.PI * 0.45;
+      scene.add(glow);
+
+      // Particles — small dots orbiting
+      const particleCount = 60;
+      const pGeo = new THREE.BufferGeometry();
+      const positions = new Float32Array(particleCount * 3);
+      for (let i = 0; i < particleCount; i++) {
+        const a = (i / particleCount) * Math.PI * 2;
+        const r = 0.5 + Math.random() * 0.5;
+        positions[i * 3] = Math.cos(a) * r;
+        positions[i * 3 + 1] = (Math.random() - 0.5) * 0.15;
+        positions[i * 3 + 2] = Math.sin(a) * r;
+      }
+      pGeo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+      const pMat = new THREE.PointsMaterial({
+        color: 0xffaa44,
+        size: 0.04,
+        transparent: true,
+        opacity: 0.7,
+      });
+      particles = new THREE.Points(pGeo, pMat);
+      scene.add(particles);
+
+      ready = true;
+    }
+
+    return {
+      update(mouseX, mouseY, strength, time, glowPulse) {
+        // Position canvas at cursor
+        container.style.left = mouseX + "px";
+        container.style.top = mouseY + "px";
+
+        // Scale based on strength + glow pulse
+        const pulse = glowPulse || 0;
+        const s = 0.7 + strength * 0.6 + pulse * 0.4;
+        container.style.width = size * s + "px";
+        container.style.height = size * s + "px";
+
+        if (!ready) return;
+
+        // Animate ring rotation
+        ring.rotation.z = time * 0.8;
+        particles.rotation.y = time * 0.6;
+        particles.rotation.x = Math.sin(time * 0.3) * 0.1;
+
+        // Glow pulse — brighten ring on absorption
+        ring.material.opacity = 0.85 + pulse * 0.15;
+        ring.material.color.setHex(
+          pulse > 0.1 ? 0xffaa55 : 0xff8833,
+        );
+
+        rendererTjs.render(scene, camera);
+      },
+      destroy() {
+        if (rendererTjs) rendererTjs.dispose();
+        container.remove();
+        // Clean up Three.js global if we loaded it
+        const s = document.querySelector(
+          'script[src*="three.min.js"]',
+        );
+        if (s) s.remove();
+      },
+    };
+  }
+
   if (window.__htmlShaderStop) window.__htmlShaderStop();
 
+  const engineKinds = ["fragment", "roll", "blackhole"];
   const config =
     typeof rawConfig === "string"
       ? { engine: "fragment", fragSrc: rawConfig, rollProgress: 1 }
       : {
-          engine: rawConfig?.engine === "roll" ? "roll" : "fragment",
+          engine: engineKinds.includes(rawConfig?.engine)
+            ? rawConfig.engine
+            : "fragment",
           fragSrc: String(rawConfig?.fragSrc || ""),
           rollProgress: clampUnit(Number(rawConfig?.rollProgress ?? 1)),
+          strength: clampUnit(Number(rawConfig?.strength ?? 0.5)),
+          radius: clampUnit(Number(rawConfig?.radius ?? 0.4)),
+          speed: clampUnit(Number(rawConfig?.speed ?? 0.5)),
+          spin: clampUnit(Number(rawConfig?.spin ?? 0.3)),
         };
 
+  // ════════════════════════════════════════════════════════════════
+  // BLACK HOLE — DOM-based engine (no WebGL, no drawElement)
+  // ════════════════════════════════════════════════════════════════
+  if (config.engine === "blackhole") {
+    const engine = createBlackholeEngine(config);
+    const bhCursor = createBlackholeCursor(() => engine.state);
+
+    // Hide native cursor
+    const cursorStyle = document.createElement("style");
+    cursorStyle.id = "__html_shader_bh_style__";
+    cursorStyle.textContent = "* { cursor: none !important; }";
+    document.head.appendChild(cursorStyle);
+
+    const startTime = performance.now();
+
+    const onMouse = (e) => {
+      engine.state.cursorX = e.clientX;
+      engine.state.cursorY = e.clientY;
+    };
+    addEventListener("mousemove", onMouse);
+
+    // Animate the Three.js cursor in sync with the engine loop
+    const bhFrame = () => {
+      if (!engine.state) return;
+      bhCursor.update(
+        engine.state.smoothX,
+        engine.state.smoothY,
+        engine.state.strength,
+        (performance.now() - startTime) / 1000,
+        engine.state.glowPulse,
+      );
+      requestAnimationFrame(bhFrame);
+    };
+
+    engine.start();
+    requestAnimationFrame(bhFrame);
+
+    const stop = () => {
+      removeEventListener("mousemove", onMouse);
+      engine.destroy();
+      bhCursor.destroy();
+      cursorStyle.remove();
+      delete window.__htmlShaderStop;
+      delete window.__htmlShaderUpdate;
+    };
+
+    window.__htmlShaderStop = stop;
+    window.__htmlShaderUpdate = (nextConfig) => {
+      if (!nextConfig) return;
+      engine.update(nextConfig);
+    };
+    return null;
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  // FRAGMENT / ROLL — drawElement + WebGL pipeline (unchanged)
+  // ════════════════════════════════════════════════════════════════
   const sourceCanvas = document.createElement("canvas");
   sourceCanvas.id = "__html_shader_source__";
   sourceCanvas.setAttribute("layoutsubtree", "");
@@ -885,10 +1425,11 @@ void main() {
 
   let renderer;
   try {
-    renderer =
-      config.engine === "roll"
-        ? createRollRenderer(gl, sourceCanvas, config)
-        : createFragmentRenderer(gl, sourceCanvas, config);
+    if (config.engine === "roll") {
+      renderer = createRollRenderer(gl, sourceCanvas, config);
+    } else {
+      renderer = createFragmentRenderer(gl, sourceCanvas, config);
+    }
   } catch (e) {
     restoreDom();
     return `Shader error: ${e.message}`;

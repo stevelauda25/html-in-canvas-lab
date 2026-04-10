@@ -51,6 +51,7 @@
       <option value="wave">Preset: Wave distortion</option>
       <option value="ascii">Preset: Pixelate</option>
       <option value="roll">Preset: 3D Roll</option>
+      <option value="blackhole">Preset: Black Hole</option>
     </select>
     <div class="editor">
       <pre id="shader-hl"><code></code></pre>
@@ -63,6 +64,36 @@
           <span id="roll_progress_value">0.10</span>
         </label>
         <input id="roll_progress" type="range" min="0" max="1" step="0.01" value="0.1" />
+      </div>
+    </div>
+    <div id="blackhole_controls" class="controls" hidden>
+      <div class="control">
+        <label for="bh_strength">
+          <span>Strength</span>
+          <span id="bh_strength_value">0.50</span>
+        </label>
+        <input id="bh_strength" type="range" min="0" max="1" step="0.01" value="0.5" />
+      </div>
+      <div class="control">
+        <label for="bh_radius">
+          <span>Radius</span>
+          <span id="bh_radius_value">0.40</span>
+        </label>
+        <input id="bh_radius" type="range" min="0.05" max="1" step="0.01" value="0.4" />
+      </div>
+      <div class="control">
+        <label for="bh_speed">
+          <span>Speed</span>
+          <span id="bh_speed_value">0.50</span>
+        </label>
+        <input id="bh_speed" type="range" min="0.01" max="1" step="0.01" value="0.5" />
+      </div>
+      <div class="control">
+        <label for="bh_spin">
+          <span>Spin</span>
+          <span id="bh_spin_value">0.30</span>
+        </label>
+        <input id="bh_spin" type="range" min="0" max="1" step="0.01" value="0.3" />
       </div>
     </div>
     <div class="row">
