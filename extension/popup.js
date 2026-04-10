@@ -108,6 +108,10 @@ void main() {
   },
   roll: {
     kind: "roll",
+    hint: "Requires <code>chrome://flags/#canvas-draw-element</code>. This preset uses a built-in WebGL mesh pass with live <code>uProgress</code> control.",
+    controls: [
+      { key: "rollProgress", label: "Roll progress", min: 0, max: 1, default: 0.1 },
+    ],
     source: `// Built-in 3D roll preset.
 // This preset swaps the fullscreen fragment pass for a subdivided mesh.
 // Use the slider below, then click Apply. If the effect is already active,
@@ -122,105 +126,69 @@ void main() {
   },
   blackhole: {
     kind: "blackhole",
+    hint: "Cursor becomes a gravitational singularity. Adjust <code>strength</code>, <code>radius</code>, <code>speed</code>, <code>spin</code> below.",
+    controls: [
+      { key: "strength", label: "Strength", min: 0, max: 1, default: 0.5 },
+      { key: "radius", label: "Radius", min: 0.05, max: 1, default: 0.4 },
+      { key: "speed", label: "Speed", min: 0.01, max: 1, default: 0.5 },
+      { key: "spin", label: "Spin", min: 0, max: 1, default: 0.3 },
+    ],
     source: `// Built-in Black Hole preset.
 // The cursor acts as a gravitational singularity.
-// The page is pulled toward it with radial distortion and spiral twist.
-// A 3D black hole with accretion ring follows the cursor.
-//
-// Engine uniforms:
-//   uCursor     cursor position in UV space
-//   uStrength   gravitational pull intensity
-//   uRadius     area of influence
-//   uSpin       spiral/vortex twist amount
-//   uTex        live drawElement() page snapshot
-//   uTime       elapsed time
-//   uResolution viewport size in device pixels`,
+// DOM elements are pulled toward it and captured.
+// A 3D black hole with accretion ring follows the cursor.`,
   },
   fireburn: {
     kind: "fireburn",
+    hint: "Hover to burn. Elements char progressively and disintegrate. Adjust <code>intensity</code>, <code>radius</code>, <code>burn speed</code>, <code>particles</code> below.",
+    controls: [
+      { key: "fbIntensity", label: "Intensity", min: 0.1, max: 1, default: 0.6 },
+      { key: "fbRadius", label: "Spread radius", min: 0.1, max: 1, default: 0.4 },
+      { key: "fbBurnspeed", label: "Burn speed", min: 0.05, max: 1, default: 0.5 },
+      { key: "fbParticles", label: "Particles", min: 0.1, max: 1, default: 0.6 },
+    ],
     source: `// Built-in Fire Burn preset.
-// Click and drag to emit fire from the cursor.
+// Hover to emit fire from the cursor.
 // Elements under fire take progressive burn damage and disintegrate.
-// No WebGL — pure DOM + Canvas 2D particle system.
-//
-// Controls:
-//   Intensity    fire particle brightness and size
-//   Spread       area of effect around cursor
-//   Burn speed   how fast elements take damage
-//   Particles    particle density multiplier`,
+// No WebGL — pure DOM + Canvas 2D particle system.`,
   },
   magnetic: {
     kind: "magnetic",
+    hint: "Cursor acts as a magnet. Elements are attracted, captured, and stack on cursor. Press <code>Space</code> to release. Toggle <code>attract/repel</code> below.",
+    controls: [
+      { key: "mgStrength", label: "Strength", min: 0.05, max: 1, default: 0.5 },
+      { key: "mgRadius", label: "Radius", min: 0.1, max: 1, default: 0.5 },
+      { key: "mgSmoothing", label: "Smoothing", min: 0.05, max: 1, default: 0.5 },
+      { key: "mgMode", label: "Mode", type: "select", options: ["attract", "repel"], default: "attract" },
+    ],
     source: `// Built-in Magnetic Field preset.
 // The cursor acts as a magnet — DOM elements are attracted or repelled.
-// No elements are removed. Layout deforms smoothly and springs back.
-// A 3D horseshoe magnet follows the cursor.
-//
-// Controls:
-//   Strength    pull/push force
-//   Radius      area of influence
-//   Smoothing   easing speed
-//   Mode        attract / repel`,
+// Captured elements follow the cursor. Press Space to release.
+// A 3D horseshoe magnet follows the cursor.`,
   },
   seedgrowth: {
     kind: "seedgrowth",
+    hint: "Click to drop seeds. Organic vines grow progressively on elements. Adjust <code>growth speed</code>, <code>density</code>, <code>spread</code> below.",
+    controls: [
+      { key: "sgGrowthSpeed", label: "Growth speed", min: 0.1, max: 1, default: 0.5 },
+      { key: "sgDensity", label: "Density", min: 0.1, max: 1, default: 0.5 },
+      { key: "sgSpread", label: "Spread", min: 0.1, max: 1, default: 0.5 },
+    ],
     source: `// Built-in Seed Growth preset.
 // Click to drop seeds. Seeds land on DOM elements and grow
-// organic vine/branch structures via animated SVG paths.
-// Growth wraps around elements and stays attached.
-//
-// Controls:
-//   Growth speed   how fast vines extend
-//   Density        branching complexity
-//   Spread         how far vines reach`,
+// organic vine/branch structures. Growth is progressive
+// from root to stem to branches to leaves.`,
   },
 };
 
 const DEFAULT_PRESET = "blur";
-const ROLL_DEFAULT_PROGRESS = 0.1;
 
 const $ = (id) => document.getElementById(id);
 const statusEl = $("status");
 const shaderEl = $("shader");
 const presetEl = $("preset");
 const presetHintEl = $("preset_hint");
-const rollControlsEl = $("roll_controls");
-const rollProgressEl = $("roll_progress");
-const rollProgressValueEl = $("roll_progress_value");
-const bhControlsEl = $("blackhole_controls");
-const bhStrengthEl = $("bh_strength");
-const bhStrengthValueEl = $("bh_strength_value");
-const bhRadiusEl = $("bh_radius");
-const bhRadiusValueEl = $("bh_radius_value");
-const bhSpeedEl = $("bh_speed");
-const bhSpeedValueEl = $("bh_speed_value");
-const bhSpinEl = $("bh_spin");
-const bhSpinValueEl = $("bh_spin_value");
-const mgControlsEl = $("magnetic_controls");
-const mgStrengthEl = $("mg_strength");
-const mgStrengthValueEl = $("mg_strength_value");
-const mgRadiusEl = $("mg_radius");
-const mgRadiusValueEl = $("mg_radius_value");
-const mgSmoothingEl = $("mg_smoothing");
-const mgSmoothingValueEl = $("mg_smoothing_value");
-const mgModeEl = $("mg_mode");
-const mgModeValueEl = $("mg_mode_value");
-const sgControlsEl = $("seedgrowth_controls");
-const sgGrowthSpeedEl = $("sg_growth_speed");
-const sgGrowthSpeedValueEl = $("sg_growth_speed_value");
-const sgDensityEl = $("sg_density");
-const sgDensityValueEl = $("sg_density_value");
-const sgSpreadEl = $("sg_spread");
-const sgSpreadValueEl = $("sg_spread_value");
-const fbControlsEl = $("fireburn_controls");
-const fbIntensityEl = $("fb_intensity");
-const fbIntensityValueEl = $("fb_intensity_value");
-const fbRadiusEl = $("fb_radius");
-const fbRadiusValueEl = $("fb_radius_value");
-const fbBurnspeedEl = $("fb_burnspeed");
-const fbBurnspeedValueEl = $("fb_burnspeed_value");
-const fbParticlesEl = $("fb_particles");
-const fbParticlesValueEl = $("fb_particles_value");
+const dynamicControlsEl = $("dynamic_controls");
 const editorEl = document.querySelector(".editor");
 const hlEl = document.querySelector("#shader-hl code");
 
@@ -377,10 +345,6 @@ function getPreset() {
   return PRESETS[presetEl.value] || PRESETS[DEFAULT_PRESET];
 }
 
-function getRollProgress() {
-  return clamp01(Number(rollProgressEl.value));
-}
-
 function clamp01(value) {
   if (!Number.isFinite(value)) return 0;
   return Math.min(1, Math.max(0, value));
@@ -390,75 +354,89 @@ function setStatus(message) {
   statusEl.textContent = message || "";
 }
 
-function setRollProgressLabel() {
-  rollProgressValueEl.textContent = getRollProgress().toFixed(2);
-}
+// ── Dynamic control system ──────────────────────────────────────
+// Renders controls from preset.controls[], reads values, syncs labels,
+// and live-updates the active engine — all from one unified codepath.
 
-function syncPresetUi() {
-  const preset = getPreset();
-  shaderEl.value = preset.source;
-  shaderEl.readOnly = preset.kind !== "fragment";
-  editorEl.classList.toggle("is-readonly", preset.kind !== "fragment");
-  rollControlsEl.hidden = preset.kind !== "roll";
-  bhControlsEl.hidden = preset.kind !== "blackhole";
-  fbControlsEl.hidden = preset.kind !== "fireburn";
-  mgControlsEl.hidden = preset.kind !== "magnetic";
-  sgControlsEl.hidden = preset.kind !== "seedgrowth";
-  if (preset.kind === "roll") {
-    presetHintEl.innerHTML =
-      "Requires <code>chrome://flags/#canvas-draw-element</code>. This preset uses a built-in WebGL mesh pass with live <code>uProgress</code> control.";
-  } else if (preset.kind === "blackhole") {
-    presetHintEl.innerHTML =
-      "Requires <code>chrome://flags/#canvas-draw-element</code>. Cursor becomes a gravitational singularity. Adjust <code>strength</code>, <code>radius</code>, <code>speed</code>, <code>spin</code> below.";
-  } else if (preset.kind === "fireburn") {
-    presetHintEl.innerHTML =
-      "Click and drag to shoot fire. Elements burn progressively and disintegrate. Adjust <code>intensity</code>, <code>radius</code>, <code>burn speed</code>, <code>particles</code> below.";
-  } else if (preset.kind === "magnetic") {
-    presetHintEl.innerHTML =
-      "Cursor acts as a magnet. Elements are attracted or repelled smoothly. Adjust <code>strength</code>, <code>radius</code>, <code>smoothing</code>, and toggle <code>attract/repel</code> below.";
-  } else if (preset.kind === "seedgrowth") {
-    presetHintEl.innerHTML =
-      "Click to drop seeds. Organic vines grow on elements where seeds land. Adjust <code>growth speed</code>, <code>density</code>, <code>spread</code> below.";
-  } else {
-    presetHintEl.innerHTML =
-      "Requires <code>chrome://flags/#canvas-draw-element</code>. Fragment presets expose <code>uTex</code>, <code>uTime</code>, <code>uResolution</code>, <code>vUv</code>.";
+function renderControls(preset) {
+  dynamicControlsEl.innerHTML = "";
+  const controls = preset.controls;
+  if (!controls || controls.length === 0) return;
+
+  for (const ctrl of controls) {
+    const div = document.createElement("div");
+    div.className = "control";
+
+    if (ctrl.type === "select") {
+      div.innerHTML = `
+        <label>
+          <span>${ctrl.label}</span>
+          <span class="__ctrl_val" data-key="${ctrl.key}">${ctrl.default}</span>
+        </label>
+        <select class="__ctrl_input" data-key="${ctrl.key}"
+          style="width:100%;background:#1a1a1a;color:#eee;border:1px solid #333;padding:4px;border-radius:4px;">
+          ${ctrl.options.map((o) => `<option value="${o}"${o === ctrl.default ? " selected" : ""}>${o}</option>`).join("")}
+        </select>`;
+    } else {
+      const val = Number(ctrl.default).toFixed(2);
+      div.innerHTML = `
+        <label>
+          <span>${ctrl.label}</span>
+          <span class="__ctrl_val" data-key="${ctrl.key}">${val}</span>
+        </label>
+        <input class="__ctrl_input" data-key="${ctrl.key}" type="range"
+          min="${ctrl.min}" max="${ctrl.max}" step="${ctrl.step || 0.01}"
+          value="${ctrl.default}" />`;
+    }
+    dynamicControlsEl.appendChild(div);
   }
-  syncHighlight();
+
+  // Attach live-update listeners
+  const inputs = dynamicControlsEl.querySelectorAll(".__ctrl_input");
+  for (const input of inputs) {
+    const evtType = input.tagName === "SELECT" ? "change" : "input";
+    input.addEventListener(evtType, async () => {
+      syncControlLabels();
+      const kind = getPreset().kind;
+      if (kind !== appState.appliedEngine) return;
+      try {
+        await inject(updateShaderConfigInPage, [getControlValues()]);
+        setStatus("");
+      } catch (e) {
+        setStatus(String(e));
+      }
+    });
+  }
 }
 
-function getBhValues() {
-  return {
-    strength: clamp01(Number(bhStrengthEl.value)),
-    radius: clamp01(Number(bhRadiusEl.value)),
-    speed: clamp01(Number(bhSpeedEl.value)),
-    spin: clamp01(Number(bhSpinEl.value)),
-  };
+function syncControlLabels() {
+  const valEls = dynamicControlsEl.querySelectorAll(".__ctrl_val");
+  for (const valEl of valEls) {
+    const key = valEl.dataset.key;
+    const input = dynamicControlsEl.querySelector(
+      `.__ctrl_input[data-key="${key}"]`,
+    );
+    if (!input) continue;
+    if (input.tagName === "SELECT") {
+      valEl.textContent = input.value;
+    } else {
+      valEl.textContent = Number(input.value).toFixed(2);
+    }
+  }
 }
 
-function getFbValues() {
-  return {
-    fbIntensity: clamp01(Number(fbIntensityEl.value)),
-    fbRadius: clamp01(Number(fbRadiusEl.value)),
-    fbBurnspeed: clamp01(Number(fbBurnspeedEl.value)),
-    fbParticles: clamp01(Number(fbParticlesEl.value)),
-  };
-}
-
-function getMgValues() {
-  return {
-    mgStrength: clamp01(Number(mgStrengthEl.value)),
-    mgRadius: clamp01(Number(mgRadiusEl.value)),
-    mgSmoothing: clamp01(Number(mgSmoothingEl.value)),
-    mgMode: mgModeEl.value === "repel" ? "repel" : "attract",
-  };
-}
-
-function getSgValues() {
-  return {
-    sgGrowthSpeed: clamp01(Number(sgGrowthSpeedEl.value)),
-    sgDensity: clamp01(Number(sgDensityEl.value)),
-    sgSpread: clamp01(Number(sgSpreadEl.value)),
-  };
+function getControlValues() {
+  const values = {};
+  const inputs = dynamicControlsEl.querySelectorAll(".__ctrl_input");
+  for (const input of inputs) {
+    const key = input.dataset.key;
+    if (input.tagName === "SELECT") {
+      values[key] = input.value;
+    } else {
+      values[key] = clamp01(Number(input.value));
+    }
+  }
+  return values;
 }
 
 function buildApplyConfig() {
@@ -466,12 +444,30 @@ function buildApplyConfig() {
   return {
     engine: preset.kind,
     fragSrc: shaderEl.value,
-    rollProgress: getRollProgress(),
-    ...getBhValues(),
-    ...getFbValues(),
-    ...getMgValues(),
-    ...getSgValues(),
+    ...getControlValues(),
   };
+}
+
+// ── Preset UI sync ──────────────────────────────────────────────
+
+function syncPresetUi() {
+  const preset = getPreset();
+  shaderEl.value = preset.source;
+  shaderEl.readOnly = preset.kind !== "fragment";
+  editorEl.classList.toggle("is-readonly", preset.kind !== "fragment");
+
+  // Render this preset's controls (or clear if none)
+  renderControls(preset);
+  syncControlLabels();
+
+  // Hint text
+  if (preset.hint) {
+    presetHintEl.innerHTML = preset.hint;
+  } else {
+    presetHintEl.innerHTML =
+      "Requires <code>chrome://flags/#canvas-draw-element</code>. Fragment presets expose <code>uTex</code>, <code>uTime</code>, <code>uResolution</code>, <code>vUv</code>.";
+  }
+  syncHighlight();
 }
 
 shaderEl.addEventListener("input", syncHighlight);
@@ -494,126 +490,12 @@ shaderEl.addEventListener("keydown", (e) => {
 });
 
 presetEl.value = DEFAULT_PRESET;
-rollProgressEl.value = String(ROLL_DEFAULT_PROGRESS);
-setRollProgressLabel();
 syncPresetUi();
 
 presetEl.addEventListener("change", () => {
   setStatus("");
   syncPresetUi();
 });
-
-rollProgressEl.addEventListener("input", async () => {
-  setRollProgressLabel();
-  if (getPreset().kind !== "roll" || appState.appliedEngine !== "roll") return;
-  try {
-    await inject(updateShaderConfigInPage, [
-      { rollProgress: getRollProgress() },
-    ]);
-    setStatus("");
-  } catch (e) {
-    setStatus(String(e));
-  }
-});
-
-function syncBhLabels() {
-  bhStrengthValueEl.textContent = clamp01(Number(bhStrengthEl.value)).toFixed(2);
-  bhRadiusValueEl.textContent = clamp01(Number(bhRadiusEl.value)).toFixed(2);
-  bhSpeedValueEl.textContent = clamp01(Number(bhSpeedEl.value)).toFixed(2);
-  bhSpinValueEl.textContent = clamp01(Number(bhSpinEl.value)).toFixed(2);
-}
-
-for (const el of [bhStrengthEl, bhRadiusEl, bhSpeedEl, bhSpinEl]) {
-  el.addEventListener("input", async () => {
-    syncBhLabels();
-    if (
-      getPreset().kind !== "blackhole" ||
-      appState.appliedEngine !== "blackhole"
-    )
-      return;
-    try {
-      await inject(updateShaderConfigInPage, [getBhValues()]);
-      setStatus("");
-    } catch (e) {
-      setStatus(String(e));
-    }
-  });
-}
-syncBhLabels();
-
-function syncFbLabels() {
-  fbIntensityValueEl.textContent = clamp01(Number(fbIntensityEl.value)).toFixed(2);
-  fbRadiusValueEl.textContent = clamp01(Number(fbRadiusEl.value)).toFixed(2);
-  fbBurnspeedValueEl.textContent = clamp01(Number(fbBurnspeedEl.value)).toFixed(2);
-  fbParticlesValueEl.textContent = clamp01(Number(fbParticlesEl.value)).toFixed(2);
-}
-
-for (const el of [fbIntensityEl, fbRadiusEl, fbBurnspeedEl, fbParticlesEl]) {
-  el.addEventListener("input", async () => {
-    syncFbLabels();
-    if (
-      getPreset().kind !== "fireburn" ||
-      appState.appliedEngine !== "fireburn"
-    )
-      return;
-    try {
-      await inject(updateShaderConfigInPage, [getFbValues()]);
-      setStatus("");
-    } catch (e) {
-      setStatus(String(e));
-    }
-  });
-}
-syncFbLabels();
-
-function syncMgLabels() {
-  mgStrengthValueEl.textContent = clamp01(Number(mgStrengthEl.value)).toFixed(2);
-  mgRadiusValueEl.textContent = clamp01(Number(mgRadiusEl.value)).toFixed(2);
-  mgSmoothingValueEl.textContent = clamp01(Number(mgSmoothingEl.value)).toFixed(2);
-  mgModeValueEl.textContent = mgModeEl.value;
-}
-
-for (const el of [mgStrengthEl, mgRadiusEl, mgSmoothingEl, mgModeEl]) {
-  el.addEventListener(el.tagName === "SELECT" ? "change" : "input", async () => {
-    syncMgLabels();
-    if (
-      getPreset().kind !== "magnetic" ||
-      appState.appliedEngine !== "magnetic"
-    )
-      return;
-    try {
-      await inject(updateShaderConfigInPage, [getMgValues()]);
-      setStatus("");
-    } catch (e) {
-      setStatus(String(e));
-    }
-  });
-}
-syncMgLabels();
-
-function syncSgLabels() {
-  sgGrowthSpeedValueEl.textContent = clamp01(Number(sgGrowthSpeedEl.value)).toFixed(2);
-  sgDensityValueEl.textContent = clamp01(Number(sgDensityEl.value)).toFixed(2);
-  sgSpreadValueEl.textContent = clamp01(Number(sgSpreadEl.value)).toFixed(2);
-}
-
-for (const el of [sgGrowthSpeedEl, sgDensityEl, sgSpreadEl]) {
-  el.addEventListener("input", async () => {
-    syncSgLabels();
-    if (
-      getPreset().kind !== "seedgrowth" ||
-      appState.appliedEngine !== "seedgrowth"
-    )
-      return;
-    try {
-      await inject(updateShaderConfigInPage, [getSgValues()]);
-      setStatus("");
-    } catch (e) {
-      setStatus(String(e));
-    }
-  });
-}
-syncSgLabels();
 
 async function inject(func, args = []) {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
