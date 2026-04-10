@@ -218,6 +218,18 @@ void main() {
 // A/D = move, Space = jump, Click = attack.
 // Both sides have 100 HP. Reduce enemy HP to 0 to win.`,
   },
+  stickman: {
+    kind: "stickman",
+    hint: "A stickman explores the page. DOM elements are platforms. <code>A/D</code> move, <code>Space</code> jump (x3), <code>Left click</code> grapple, <code>Right click</code> teleport down.",
+    controls: [
+      { key: "smGravity", label: "Gravity", min: 0.2, max: 1, default: 0.5 },
+      { key: "smSpeed", label: "Speed", min: 0.2, max: 1, default: 0.5 },
+    ],
+    source: `// Built-in Stickman Explorer preset.
+// A physics-based stickman walks on DOM elements.
+// A/D = move, Space = jump (triple), Click = grapple, Right-click = dig.
+// DOM elements act as platforms and terrain.`,
+  },
 };
 
 const DEFAULT_PRESET = "blur";
@@ -3939,6 +3951,630 @@ void main() {
     };
   }
 
+  // ── Stickman Explorer engine (refined) ──────────────────────────
+  // 5x larger character, pure black, hard collision on ALL DOM blocks,
+  // jump scaling (100%/200%/500%), dig with axe+crack+shake+debris.
+  function createStickmanEngine(config) {
+    const GRAV = 800 + clampUnit(Number(config.smGravity ?? 0.5)) * 900;
+    const SPD = 220 + clampUnit(Number(config.smSpeed ?? 0.5)) * 200;
+    const JUMP1 = -(450 + clampUnit(Number(config.smGravity ?? 0.5)) * 250);
+    const MAX_JUMPS = 3;
+    const GRAPPLE_SPD = 500;
+    const W = innerWidth;
+    const H = innerHeight;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+
+    // Character dimensions (5x original: w=50 h=140 head=25)
+    const CW = 50;
+    const CH = 140;
+    const HEAD_R = 22;
+    const COL = "#000";
+
+    const cv = document.createElement("canvas");
+    cv.id = "__html_shader_stickman_cv__";
+    Object.assign(cv.style, {
+      position: "fixed", inset: "0", width: "100vw", height: "100vh",
+      pointerEvents: "none", zIndex: "2147483647",
+    });
+    cv.width = Math.floor(W * dpr);
+    cv.height = Math.floor(H * dpr);
+    document.body.appendChild(cv);
+    const ctx = cv.getContext("2d");
+    ctx.scale(dpr, dpr);
+
+    const hud = document.createElement("div");
+    Object.assign(hud.style, {
+      position: "fixed", bottom: "8px", left: "50%", transform: "translateX(-50%)",
+      display: "flex", gap: "14px", padding: "6px 16px", borderRadius: "6px",
+      background: "rgba(0,0,0,0.7)", backdropFilter: "blur(4px)",
+      fontFamily: "monospace", fontSize: "10px", color: "#bbb",
+      zIndex: "2147483647", pointerEvents: "none",
+    });
+    for (const [k, l] of [["A/D","Move"],["Space","Jump x3"],["Click","Grapple"],["R-Click","Teleport"],["F1","Debug"],["ESC","Exit"]]) {
+      const s = document.createElement("span");
+      s.innerHTML = `<span style="background:#333;color:#fff;padding:1px 5px;border-radius:3px;margin-right:3px">${k}</span>${l}`;
+      hud.appendChild(s);
+    }
+    document.body.appendChild(hud);
+
+    // Debris particles for dig
+    const debris = [];
+
+    // Blackhole teleport effects
+    const bhEffects = []; // { x, y, age, maxAge }
+
+    const ch = {
+      x: W / 2, y: 50,
+      vx: 0, vy: 0,
+      grounded: false, jumpsLeft: MAX_JUMPS, facing: 1, walkPhase: 0,
+      squash: 1, stretch: 1, landBounce: 0,
+      grappling: false, grappleX: 0, grappleY: 0,
+      grappleTargetX: 0, grappleTargetY: 0,
+      grappleLen: 0, grappleExtend: 0, grappleAttached: false,
+      teleportFlash: 0,
+    };
+
+    const keys = { a: false, d: false, space: false };
+    let spaceJP = false;
+    let mouseX = W / 2, mouseY = H / 2;
+    let shakeX = 0, shakeY = 0, shakeDur = 0;
+
+    function onKD(e) {
+      if (e.key === "a" || e.key === "A") keys.a = true;
+      if (e.key === "d" || e.key === "D") keys.d = true;
+      if (e.key === " ") { if (!keys.space) spaceJP = true; keys.space = true; e.preventDefault(); }
+      if (e.key === "Escape") { e.preventDefault(); cleanup(); }
+      if (e.key === "F1") { e.preventDefault(); debugMode = !debugMode; }
+    }
+    function onKU(e) {
+      if (e.key === "a" || e.key === "A") keys.a = false;
+      if (e.key === "d" || e.key === "D") keys.d = false;
+      if (e.key === " ") keys.space = false;
+    }
+    function onMM(e) { mouseX = e.clientX; mouseY = e.clientY; }
+    function onMD(e) {
+      if (e.button === 0) shootGrapple();
+      if (e.button === 2) teleportDown();
+    }
+    function onCM(e) { e.preventDefault(); }
+
+    addEventListener("keydown", onKD);
+    addEventListener("keyup", onKU);
+    addEventListener("mousemove", onMM);
+    addEventListener("mousedown", onMD);
+    addEventListener("contextmenu", onCM);
+
+    // ═══════════════════════════════════════════════════════════════
+    // COLLISION — destroyed elements are excluded via data attribute.
+    // No masks, no splitting, no virtual holes. Simple and correct.
+    // ═══════════════════════════════════════════════════════════════
+
+    const SKIP = "[id^='__html_shader']";
+    let debugMode = false;
+    let cacheT = 0;
+
+    // collMap: array of { el, l, r, t, b }
+    let collMap = [];
+
+    function isSolid(el) {
+      if (el.closest(SKIP)) return false;
+      const cs = getComputedStyle(el);
+
+      // Must be visible
+      if (cs.display === "none" || cs.visibility === "hidden") return false;
+      if (parseFloat(cs.opacity) < 0.05) return false;
+
+      const r = el.getBoundingClientRect();
+
+      // Must have meaningful size
+      if (r.width < 20 || r.height < 8) return false;
+      // Skip offscreen
+      if (r.bottom < -50 || r.top > H + 50) return false;
+
+      // Skip fixed/sticky overlays (navbars, modals, banners)
+      if (cs.position === "fixed" || cs.position === "sticky") return false;
+
+      // Must have visual presence: background, border, or content
+      const hasBackground =
+        cs.backgroundColor !== "rgba(0, 0, 0, 0)" &&
+        cs.backgroundColor !== "transparent";
+
+      const hasBorder = parseFloat(cs.borderTopWidth) > 0 ||
+        parseFloat(cs.borderBottomWidth) > 0;
+
+      const hasBgImage = cs.backgroundImage !== "none";
+
+      const hasContent =
+        el.innerText && el.innerText.trim().length > 0 ||
+        el.querySelector("img, svg, canvas, video");
+
+      // Elements with no visual fill and no content are invisible wrappers
+      if (!hasBackground && !hasBorder && !hasBgImage && !hasContent) return false;
+
+      // Full-viewport wrappers — skip generic containers covering entire screen
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const tag = el.tagName.toLowerCase();
+      const WRAPPER_TAGS = new Set(["div","section","main","article","form","fieldset"]);
+      if (WRAPPER_TAGS.has(tag) && r.width > vw * 0.9 && r.height > vh * 0.9 && !hasBackground && !hasBgImage) return false;
+
+      return true;
+    }
+
+    function refreshCollisionMap() {
+      const all = document.body.querySelectorAll(
+        "h1,h2,h3,h4,h5,h6,p,a,button,img,li,span," +
+          "div,section,nav,article,header,footer,ul,ol," +
+          "input,textarea,select,label,code,pre,blockquote," +
+          "table,tr,td,th,figure,figcaption,svg",
+      );
+      collMap = [];
+      for (const el of all) {
+        if (!isSolid(el)) continue;
+        const r = el.getBoundingClientRect();
+        collMap.push({ el, l: r.left, r: r.right, t: r.top, b: r.bottom });
+      }
+      // Floor at bottom of viewport
+      collMap.push({ el: null, l: -100, r: W + 100, t: H - 2, b: H + 100 });
+    }
+
+    // (destroyElement removed — replaced by blackhole teleport)
+
+    // ── Collision resolution ──
+    function resolveCollision() {
+      const wasGrounded = ch.grounded;
+      ch.grounded = false;
+      const hw = CW / 2;
+      const feet = ch.y;
+      const head = ch.y - CH;
+      const left = ch.x - hw;
+      const right = ch.x + hw;
+
+      for (const c of collMap) {
+        if (right <= c.l || left >= c.r) continue;
+        if (feet < c.t - 20 || head > c.b + 20) continue;
+
+        // Top (landing)
+        if (ch.vy >= 0 && feet >= c.t && feet <= c.t + 20 && head < c.t) {
+          ch.y = c.t;
+          if (ch.vy > 100 && !wasGrounded) ch.landBounce = Math.min(ch.vy * 0.003, 0.15);
+          ch.vy = 0;
+          ch.grounded = true;
+          ch.jumpsLeft = MAX_JUMPS;
+          continue;
+        }
+        // Ceiling
+        if (ch.vy < 0 && head <= c.b && head >= c.b - 20 && feet > c.b) {
+          ch.y = c.b + CH;
+          ch.vy = 0;
+          continue;
+        }
+        // Side (walls > 20px tall)
+        if (feet > c.t + 10 && head < c.b - 5 && (c.b - c.t) > 20) {
+          if (ch.vx > 0 && right > c.l && ch.x - hw < c.l) {
+            ch.x = c.l - hw; ch.vx = 0;
+          } else if (ch.vx < 0 && left < c.r && ch.x + hw > c.r) {
+            ch.x = c.r + hw; ch.vx = 0;
+          }
+        }
+      }
+    }
+
+    // ── Debug overlay ──
+    function drawDebug() {
+      if (!debugMode) return;
+      ctx.save();
+
+      // Solid platforms
+      ctx.globalAlpha = 0.25;
+      for (const c of collMap) {
+        if (!c.el) {
+          ctx.strokeStyle = "#0f0";
+          ctx.lineWidth = 2;
+          ctx.strokeRect(c.l, c.t, c.r - c.l, 4);
+          continue;
+        }
+        ctx.strokeStyle = "#0ff";
+        ctx.lineWidth = 1;
+        ctx.strokeRect(c.l, c.t, c.r - c.l, c.b - c.t);
+      }
+
+      // Character hitbox
+      ctx.globalAlpha = 0.4;
+      ctx.strokeStyle = "#ff0";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(ch.x - CW / 2, ch.y - CH, CW, CH);
+      ctx.fillStyle = "#f0f";
+      ctx.fillRect(ch.x - 3, ch.y - 3, 6, 6);
+
+      ctx.restore();
+    }
+
+    // ── Grapple ──
+    function shootGrapple() {
+      if (ch.grappling) { ch.grappling = false; ch.grappleAttached = false; return; }
+      const dx = mouseX - ch.x, dy = mouseY - (ch.y - CH / 2);
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist < 20) return;
+      ch.grappling = true; ch.grappleAttached = false;
+      ch.grappleX = ch.x; ch.grappleY = ch.y - CH / 2;
+      ch.grappleTargetX = mouseX; ch.grappleTargetY = mouseY;
+      ch.grappleLen = dist; ch.grappleExtend = 0;
+    }
+
+    function updateGrapple(dt) {
+      if (!ch.grappling) return;
+      if (!ch.grappleAttached) {
+        ch.grappleExtend += GRAPPLE_SPD * 2 * dt;
+        const t = Math.min(ch.grappleExtend / ch.grappleLen, 1);
+        const hx = ch.x + (ch.grappleTargetX - ch.x) * t;
+        const hy = (ch.y - CH / 2) + (ch.grappleTargetY - (ch.y - CH / 2)) * t;
+        ch.grappleX = hx; ch.grappleY = hy;
+        for (const c of collMap) {
+          if (hx >= c.l && hx <= c.r && hy >= c.t && hy <= c.b) {
+            ch.grappleAttached = true; break;
+          }
+        }
+        if (t >= 1 && !ch.grappleAttached) ch.grappling = false;
+        return;
+      }
+      const dx = ch.grappleX - ch.x, dy = ch.grappleY - (ch.y - CH / 2);
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist < 25) { ch.grappling = false; ch.grappleAttached = false; ch.vy = Math.min(ch.vy, -150); return; }
+      ch.vx += (dx / dist) * GRAPPLE_SPD * dt * 3;
+      ch.vy += (dy / dist) * GRAPPLE_SPD * dt * 3;
+      if (spaceJP) ch.vy -= 200;
+    }
+
+    // ── Blackhole teleport (replaces dig) ──
+    // Right-click: scan elements below character, teleport to next valid surface
+    function teleportDown() {
+      cv.style.pointerEvents = "none";
+
+      const vh = window.innerHeight;
+
+      // Teleport reuses isSolid() but also skips our own canvas/hud
+      function isTeleportValid(el) {
+        if (!el || el === document.body || el === document.documentElement) return false;
+        if (el === cv || el === hud) return false;
+        return isSolid(el);
+      }
+
+      // ── Find current ground element (what we're standing on) ──
+      const feetStack = document.elementsFromPoint(ch.x, ch.y + 5);
+      let currentEl = null;
+      if (feetStack) {
+        for (const el of feetStack) {
+          if (!isTeleportValid(el)) continue;
+          const r = el.getBoundingClientRect();
+          if (Math.abs(ch.y - r.top) < 25) { currentEl = el; break; }
+        }
+      }
+
+      // ── Scan downward with offset to find the NEXT layer below ──
+      let target = null;
+      let targetRect = null;
+
+      for (let offset = 20; offset < vh; offset += 20) {
+        const scanY = ch.y + offset;
+        if (scanY > vh) break;
+
+        const els = document.elementsFromPoint(ch.x, scanY);
+        if (!els) continue;
+
+        // Reverse: elementsFromPoint returns top-to-bottom z-order,
+        // so reverse to pick the deepest (bottommost) element first
+        const reversed = [...els].reverse();
+        for (const el of reversed) {
+          if (!isTeleportValid(el)) continue;
+          if (el === currentEl) continue;
+
+          const r = el.getBoundingClientRect();
+          // Must be genuinely below current position
+          if (r.top <= ch.y) continue;
+
+          target = el;
+          targetRect = r;
+          break;
+        }
+
+        if (target) break;
+      }
+
+      if (!target || !targetRect) return; // nowhere to go
+
+      // Debug: log and highlight target
+      console.log("teleport target:", target);
+      const prevOutline = target.style.outline;
+      target.style.outline = "2px solid red";
+      setTimeout(() => { target.style.outline = prevOutline; }, 400);
+
+      // Spawn blackhole effect at departure point
+      bhEffects.push({ x: ch.x, y: ch.y, age: 0, maxAge: 0.6 });
+
+      // Teleport character — land ON TOP of the target element
+      const oldY = ch.y;
+      ch.y = targetRect.top - CH - 2;
+      ch.vy = 2; // gentle drop
+      ch.grounded = false;
+      ch.teleportFlash = 0.3;
+
+      // Spawn blackhole effect at arrival point
+      bhEffects.push({ x: ch.x, y: ch.y, age: 0, maxAge: 0.6 });
+
+      // Debris at departure
+      for (let i = 0; i < 8; i++) {
+        debris.push({
+          x: ch.x + (Math.random() - 0.5) * 40,
+          y: oldY + (Math.random() - 0.5) * 20,
+          vx: (Math.random() - 0.5) * 100,
+          vy: -30 - Math.random() * 60,
+          life: 0.3 + Math.random() * 0.3,
+          size: 1.5 + Math.random() * 3,
+        });
+      }
+
+      shakeDur = 0.15;
+    }
+
+    // ── Draw character (5x, pure black) ──
+    function drawChar() {
+      ctx.save();
+      ctx.translate(ch.x + shakeX, ch.y + shakeY);
+
+      // Squash/stretch
+      const sq = 1 + ch.landBounce;
+      const st = 1 - ch.landBounce * 0.5;
+      ctx.scale(st, sq);
+
+      const f = ch.facing;
+      const isWalk = ch.grounded && Math.abs(ch.vx) > 15;
+      const isJump = !ch.grounded;
+      const p = ch.walkPhase;
+
+      ctx.strokeStyle = COL;
+      ctx.fillStyle = COL;
+      ctx.lineWidth = 6;
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+
+      // Head
+      ctx.beginPath();
+      ctx.arc(0, -CH + HEAD_R + 2, HEAD_R, 0, Math.PI * 2);
+      ctx.fill();
+      // Eye (white dot)
+      ctx.fillStyle = "#fff";
+      ctx.beginPath();
+      ctx.arc(f * 8, -CH + HEAD_R, 4, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = COL;
+      ctx.beginPath();
+      ctx.arc(f * 9, -CH + HEAD_R, 2, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.strokeStyle = COL;
+      ctx.lineWidth = 7;
+
+      // Neck → hip
+      const neckY = -CH + HEAD_R * 2 + 6;
+      const hipY = -25;
+      ctx.beginPath(); ctx.moveTo(0, neckY); ctx.lineTo(0, hipY); ctx.stroke();
+
+      // Shoulders
+      const shY = neckY + 10;
+
+      if (isWalk) {
+        const leg = Math.sin(p) * 35;
+        const arm = Math.sin(p + Math.PI) * 25;
+        // Legs
+        ctx.lineWidth = 6;
+        ctx.beginPath(); ctx.moveTo(0, hipY); ctx.lineTo(leg, 0); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(0, hipY); ctx.lineTo(-leg, 0); ctx.stroke();
+        // Arms
+        ctx.lineWidth = 5;
+        ctx.beginPath(); ctx.moveTo(0, shY); ctx.lineTo(arm * f, shY + 40); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(0, shY); ctx.lineTo(-arm * f, shY + 40); ctx.stroke();
+      } else if (isJump) {
+        ctx.lineWidth = 6;
+        ctx.beginPath(); ctx.moveTo(0, hipY); ctx.lineTo(-15, -10); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(0, hipY); ctx.lineTo(15, -10); ctx.stroke();
+        ctx.lineWidth = 5;
+        ctx.beginPath(); ctx.moveTo(0, shY); ctx.lineTo(-20 * f, shY - 15); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(0, shY); ctx.lineTo(20 * f, shY - 15); ctx.stroke();
+      } else {
+        const br = Math.sin(performance.now() * 0.003) * 3;
+        ctx.lineWidth = 6;
+        ctx.beginPath(); ctx.moveTo(0, hipY); ctx.lineTo(-12, 0); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(0, hipY); ctx.lineTo(12, 0); ctx.stroke();
+        ctx.lineWidth = 5;
+        ctx.beginPath(); ctx.moveTo(0, shY); ctx.lineTo(-18, shY + 35 + br); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(0, shY); ctx.lineTo(18, shY + 35 + br); ctx.stroke();
+      }
+
+      // Teleport flash glow on character
+      if (ch.teleportFlash > 0) {
+        ctx.beginPath();
+        ctx.arc(0, -CH / 2, 30, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(80, 0, 180, ${ch.teleportFlash})`;
+        ctx.fill();
+      }
+
+      ctx.restore();
+    }
+
+    function drawGrapple() {
+      if (!ch.grappling) return;
+      ctx.beginPath();
+      ctx.moveTo(ch.x, ch.y - CH / 2);
+      ctx.lineTo(ch.grappleX, ch.grappleY);
+      ctx.strokeStyle = ch.grappleAttached ? "#fa0" : "#666";
+      ctx.lineWidth = ch.grappleAttached ? 3 : 2;
+      ctx.setLineDash(ch.grappleAttached ? [] : [6, 6]);
+      ctx.stroke(); ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.arc(ch.grappleX, ch.grappleY, 5, 0, Math.PI * 2);
+      ctx.fillStyle = ch.grappleAttached ? "#fa0" : "#888";
+      ctx.fill();
+    }
+
+    function drawDebris(dt) {
+      for (let i = debris.length - 1; i >= 0; i--) {
+        const d = debris[i];
+        d.life -= dt;
+        if (d.life <= 0) { debris.splice(i, 1); continue; }
+        d.vy += 200 * dt;
+        d.x += d.vx * dt; d.y += d.vy * dt;
+        ctx.fillStyle = `rgba(100, 70, 30, ${d.life * 2})`;
+        ctx.fillRect(d.x - d.size / 2, d.y - d.size / 2, d.size, d.size);
+      }
+    }
+
+    function followCamera() {
+      const m = H * 0.3;
+      if (ch.y - CH < m) window.scrollBy(0, -4);
+      else if (ch.y > H - m) window.scrollBy(0, 4);
+      if (ch.x < W * 0.2) window.scrollBy(-4, 0);
+      else if (ch.x > W * 0.8) window.scrollBy(4, 0);
+    }
+
+    let running = true, raf = 0, lastTime = performance.now(), exitCb = null;
+    function setExitCallback(cb) { exitCb = cb; }
+    function cleanup() { if (exitCb) exitCb(); }
+
+    function tick() {
+      if (!running) return;
+      const now = performance.now();
+      const dt = Math.min((now - lastTime) / 1000, 0.05);
+      lastTime = now;
+
+      cacheT -= dt;
+      if (cacheT <= 0) { refreshCollisionMap(); cacheT = 0.4; }
+
+      // Input
+      if (keys.a) { ch.vx += (-SPD - ch.vx) * 0.12; ch.facing = -1; }
+      else if (keys.d) { ch.vx += (SPD - ch.vx) * 0.12; ch.facing = 1; }
+      else { ch.vx *= 0.82; }
+
+      // Jump scaling: 1x=100%, 2x=200%, 3x=500%
+      if (spaceJP && ch.jumpsLeft > 0 && !ch.grappleAttached) {
+        const jumpNum = MAX_JUMPS - ch.jumpsLeft + 1;
+        const scale = jumpNum === 1 ? 1 : jumpNum === 2 ? 2 : 5;
+        ch.vy = JUMP1 * scale;
+        ch.jumpsLeft--;
+        ch.grounded = false;
+        ch.squash = 0.7; ch.stretch = 1.3;
+      }
+      spaceJP = false;
+
+      if (ch.grounded && Math.abs(ch.vx) > 15) ch.walkPhase += Math.abs(ch.vx) * dt * 0.06;
+
+      updateGrapple(dt);
+      if (!ch.grappleAttached) ch.vy += GRAV * dt;
+      ch.x += ch.vx * dt;
+      ch.y += ch.vy * dt;
+      resolveCollision();
+
+      // Safety: if grounded, verify ground still exists beneath feet
+      if (ch.grounded) {
+        let hasGround = false;
+        const feetY = ch.y;
+        for (const c of collMap) {
+          if (ch.x >= c.l && ch.x <= c.r && feetY >= c.t - 2 && feetY <= c.t + 5) {
+            hasGround = true;
+            break;
+          }
+        }
+        if (!hasGround) {
+          ch.grounded = false;
+          ch.jumpsLeft = Math.min(ch.jumpsLeft, MAX_JUMPS - 1);
+        }
+      }
+
+      ch.x = Math.max(CW / 2, Math.min(W - CW / 2, ch.x));
+
+      // Squash/stretch/bounce decay
+      ch.squash += (1 - ch.squash) * 0.15;
+      ch.stretch += (1 - ch.stretch) * 0.15;
+      ch.landBounce *= 0.85;
+      if (ch.teleportFlash > 0) ch.teleportFlash -= dt;
+
+      // Screen shake
+      if (shakeDur > 0) {
+        shakeDur -= dt;
+        shakeX = (Math.random() - 0.5) * 8;
+        shakeY = (Math.random() - 0.5) * 6;
+      } else { shakeX = 0; shakeY = 0; }
+
+      followCamera();
+
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, cv.width, cv.height);
+      ctx.restore();
+
+      drawGrapple();
+      drawChar();
+      drawDebris(dt);
+      drawDebug();
+
+      // Blackhole effects
+      for (let i = bhEffects.length - 1; i >= 0; i--) {
+        const bh = bhEffects[i];
+        bh.age += dt;
+        if (bh.age >= bh.maxAge) { bhEffects.splice(i, 1); continue; }
+        const t = bh.age / bh.maxAge;
+        const r = 25 * (1 - t * t); // shrinks
+        const alpha = (1 - t) * 0.7;
+        // Dark core
+        ctx.beginPath();
+        ctx.arc(bh.x, bh.y, r, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(0, 0, 0, ${alpha})`;
+        ctx.fill();
+        // Purple ring
+        ctx.beginPath();
+        ctx.arc(bh.x, bh.y, r * 1.4, 0, Math.PI * 2);
+        ctx.strokeStyle = `rgba(120, 40, 200, ${alpha * 0.6})`;
+        ctx.lineWidth = 2 + (1 - t) * 3;
+        ctx.stroke();
+        // Outer glow
+        ctx.beginPath();
+        ctx.arc(bh.x, bh.y, r * 2, 0, Math.PI * 2);
+        ctx.strokeStyle = `rgba(80, 20, 160, ${alpha * 0.2})`;
+        ctx.lineWidth = 4;
+        ctx.stroke();
+      }
+
+      // Jump count
+      if (!ch.grounded && ch.jumpsLeft > 0) {
+        ctx.fillStyle = COL;
+        ctx.font = "bold 14px monospace";
+        ctx.textAlign = "center";
+        ctx.fillText("x" + ch.jumpsLeft, ch.x, ch.y - CH - 12);
+      }
+
+      raf = requestAnimationFrame(tick);
+    }
+
+    return {
+      state: {},
+      setExitCallback,
+      start() { running = true; lastTime = performance.now(); refreshCollisionMap(); tick(); },
+      update() {},
+      destroy() {
+        running = false;
+        cancelAnimationFrame(raf);
+        removeEventListener("keydown", onKD);
+        removeEventListener("keyup", onKU);
+        removeEventListener("mousemove", onMM);
+        removeEventListener("mousedown", onMD);
+        removeEventListener("contextmenu", onCM);
+        collMap = [];
+        bhEffects.length = 0;
+        cv.remove(); hud.remove();
+      },
+    };
+  }
+
   // ── Three.js horseshoe magnet cursor ──────────────────────────
   function createMagnetCursor() {
     const container = document.createElement("canvas");
@@ -4232,7 +4868,7 @@ void main() {
 
   if (window.__htmlShaderStop) window.__htmlShaderStop();
 
-  const engineKinds = ["fragment", "roll", "blackhole", "fireburn", "magnetic", "seedgrowth", "liquid", "storm", "fighting"];
+  const engineKinds = ["fragment", "roll", "blackhole", "fireburn", "magnetic", "seedgrowth", "liquid", "storm", "fighting", "stickman"];
   const config =
     typeof rawConfig === "string"
       ? { engine: "fragment", fragSrc: rawConfig, rollProgress: 1 }
@@ -4265,6 +4901,8 @@ void main() {
           stRadius: clampUnit(Number(rawConfig?.stRadius ?? 0.5)),
           stChaos: clampUnit(Number(rawConfig?.stChaos ?? 0.4)),
           ftDifficulty: clampUnit(Number(rawConfig?.ftDifficulty ?? 0.4)),
+          smGravity: clampUnit(Number(rawConfig?.smGravity ?? 0.5)),
+          smSpeed: clampUnit(Number(rawConfig?.smSpeed ?? 0.5)),
         };
 
   // ════════════════════════════════════════════════════════════════
@@ -4608,6 +5246,26 @@ void main() {
       delete window.__htmlShaderStop;
       delete window.__htmlShaderUpdate;
     };
+
+    window.__htmlShaderStop = stop;
+    window.__htmlShaderUpdate = () => {};
+    return null;
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  // STICKMAN EXPLORER — canvas overlay + DOM collision
+  // ════════════════════════════════════════════════════════════════
+  if (config.engine === "stickman") {
+    const engine = createStickmanEngine(config);
+
+    const stop = () => {
+      engine.destroy();
+      delete window.__htmlShaderStop;
+      delete window.__htmlShaderUpdate;
+    };
+
+    engine.setExitCallback(stop);
+    engine.start();
 
     window.__htmlShaderStop = stop;
     window.__htmlShaderUpdate = () => {};
