@@ -136,6 +136,19 @@ void main() {
 //   uTime       elapsed time
 //   uResolution viewport size in device pixels`,
   },
+  fireburn: {
+    kind: "fireburn",
+    source: `// Built-in Fire Burn preset.
+// Click and drag to emit fire from the cursor.
+// Elements under fire take progressive burn damage and disintegrate.
+// No WebGL — pure DOM + Canvas 2D particle system.
+//
+// Controls:
+//   Intensity    fire particle brightness and size
+//   Spread       area of effect around cursor
+//   Burn speed   how fast elements take damage
+//   Particles    particle density multiplier`,
+  },
 };
 
 const DEFAULT_PRESET = "blur";
@@ -158,6 +171,15 @@ const bhSpeedEl = $("bh_speed");
 const bhSpeedValueEl = $("bh_speed_value");
 const bhSpinEl = $("bh_spin");
 const bhSpinValueEl = $("bh_spin_value");
+const fbControlsEl = $("fireburn_controls");
+const fbIntensityEl = $("fb_intensity");
+const fbIntensityValueEl = $("fb_intensity_value");
+const fbRadiusEl = $("fb_radius");
+const fbRadiusValueEl = $("fb_radius_value");
+const fbBurnspeedEl = $("fb_burnspeed");
+const fbBurnspeedValueEl = $("fb_burnspeed_value");
+const fbParticlesEl = $("fb_particles");
+const fbParticlesValueEl = $("fb_particles_value");
 const editorEl = document.querySelector(".editor");
 const hlEl = document.querySelector("#shader-hl code");
 
@@ -338,12 +360,16 @@ function syncPresetUi() {
   editorEl.classList.toggle("is-readonly", preset.kind !== "fragment");
   rollControlsEl.hidden = preset.kind !== "roll";
   bhControlsEl.hidden = preset.kind !== "blackhole";
+  fbControlsEl.hidden = preset.kind !== "fireburn";
   if (preset.kind === "roll") {
     presetHintEl.innerHTML =
       "Requires <code>chrome://flags/#canvas-draw-element</code>. This preset uses a built-in WebGL mesh pass with live <code>uProgress</code> control.";
   } else if (preset.kind === "blackhole") {
     presetHintEl.innerHTML =
       "Requires <code>chrome://flags/#canvas-draw-element</code>. Cursor becomes a gravitational singularity. Adjust <code>strength</code>, <code>radius</code>, <code>speed</code>, <code>spin</code> below.";
+  } else if (preset.kind === "fireburn") {
+    presetHintEl.innerHTML =
+      "Click and drag to shoot fire. Elements burn progressively and disintegrate. Adjust <code>intensity</code>, <code>radius</code>, <code>burn speed</code>, <code>particles</code> below.";
   } else {
     presetHintEl.innerHTML =
       "Requires <code>chrome://flags/#canvas-draw-element</code>. Fragment presets expose <code>uTex</code>, <code>uTime</code>, <code>uResolution</code>, <code>vUv</code>.";
@@ -360,6 +386,15 @@ function getBhValues() {
   };
 }
 
+function getFbValues() {
+  return {
+    fbIntensity: clamp01(Number(fbIntensityEl.value)),
+    fbRadius: clamp01(Number(fbRadiusEl.value)),
+    fbBurnspeed: clamp01(Number(fbBurnspeedEl.value)),
+    fbParticles: clamp01(Number(fbParticlesEl.value)),
+  };
+}
+
 function buildApplyConfig() {
   const preset = getPreset();
   return {
@@ -367,6 +402,7 @@ function buildApplyConfig() {
     fragSrc: shaderEl.value,
     rollProgress: getRollProgress(),
     ...getBhValues(),
+    ...getFbValues(),
   };
 }
 
@@ -436,6 +472,31 @@ for (const el of [bhStrengthEl, bhRadiusEl, bhSpeedEl, bhSpinEl]) {
   });
 }
 syncBhLabels();
+
+function syncFbLabels() {
+  fbIntensityValueEl.textContent = clamp01(Number(fbIntensityEl.value)).toFixed(2);
+  fbRadiusValueEl.textContent = clamp01(Number(fbRadiusEl.value)).toFixed(2);
+  fbBurnspeedValueEl.textContent = clamp01(Number(fbBurnspeedEl.value)).toFixed(2);
+  fbParticlesValueEl.textContent = clamp01(Number(fbParticlesEl.value)).toFixed(2);
+}
+
+for (const el of [fbIntensityEl, fbRadiusEl, fbBurnspeedEl, fbParticlesEl]) {
+  el.addEventListener("input", async () => {
+    syncFbLabels();
+    if (
+      getPreset().kind !== "fireburn" ||
+      appState.appliedEngine !== "fireburn"
+    )
+      return;
+    try {
+      await inject(updateShaderConfigInPage, [getFbValues()]);
+      setStatus("");
+    } catch (e) {
+      setStatus(String(e));
+    }
+  });
+}
+syncFbLabels();
 
 async function inject(func, args = []) {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -1119,6 +1180,460 @@ void main() {
     };
   }
 
+  // ── Fire Burn DOM engine ────────────────────────────────────────
+  // Click-drag to emit fire. Progressive burn damage to DOM elements.
+  // Particle system: fire + embers + smoke on Canvas 2D overlay.
+  // Burn mask tracks scorched areas with charred visual overlay.
+  // ── Fire Burn DOM engine ────────────────────────────────────────
+  // Hover-driven, element-bound burns.
+  // All persistent burn state (scars, damage) is stored per-element
+  // and applied via inline CSS — scrolls with the element.
+  // Only particles + glow use a viewport-fixed canvas (ephemeral).
+  function createFireBurnEngine(config) {
+    const state = {
+      cursorX: -9999,
+      cursorY: -9999,
+      prevX: -9999,
+      prevY: -9999,
+      active: false,
+      intensity: clampUnit(Number(config.fbIntensity ?? 0.6)),
+      radius: clampUnit(Number(config.fbRadius ?? 0.4)),
+      burnSpeed: clampUnit(Number(config.fbBurnspeed ?? 0.5)),
+      particleDensity: clampUnit(Number(config.fbParticles ?? 0.6)),
+    };
+
+    const getRadiusPx = () => 20 + state.radius * 60;
+    const pDpr = Math.min(window.devicePixelRatio || 1, 2);
+    const cw = Math.floor(innerWidth * pDpr);
+    const ch = Math.floor(innerHeight * pDpr);
+
+    // ── Particle canvas (viewport-fixed, ephemeral — clears each frame) ──
+    const fireCanvas = document.createElement("canvas");
+    fireCanvas.id = "__html_shader_fire_canvas__";
+    Object.assign(fireCanvas.style, {
+      position: "fixed", inset: "0",
+      width: "100vw", height: "100vh",
+      pointerEvents: "none", zIndex: "2147483647",
+    });
+    fireCanvas.width = cw;
+    fireCanvas.height = ch;
+    document.body.appendChild(fireCanvas);
+    const fCtx = fireCanvas.getContext("2d");
+    fCtx.scale(pDpr, pDpr);
+
+    // ── Glow canvas (viewport-fixed, ephemeral) ──
+    const glowCanvas = document.createElement("canvas");
+    glowCanvas.id = "__html_shader_fire_glow__";
+    Object.assign(glowCanvas.style, {
+      position: "fixed", inset: "0",
+      width: "100vw", height: "100vh",
+      pointerEvents: "none", zIndex: "2147483646",
+      mixBlendMode: "screen", opacity: "0.7",
+    });
+    glowCanvas.width = cw;
+    glowCanvas.height = ch;
+    document.body.appendChild(glowCanvas);
+    const gCtx = glowCanvas.getContext("2d");
+    gCtx.scale(pDpr, pDpr);
+
+    // ── Particles (viewport coordinates — ephemeral) ──
+    const particles = [];
+    const MAX_PARTICLES = 400;
+
+    function spawnFlame(x, y, count) {
+      for (let i = 0; i < count && particles.length < MAX_PARTICLES; i++) {
+        const a = -Math.PI / 2 + (Math.random() - 0.5) * 0.8;
+        const spd = 15 + Math.random() * 50 * state.intensity;
+        const life = 0.2 + Math.random() * 0.4;
+        particles.push({
+          kind: 0, x: x + (Math.random() - 0.5) * 6,
+          y: y + (Math.random() - 0.5) * 6,
+          vx: Math.cos(a) * spd + (Math.random() - 0.5) * 20,
+          vy: Math.sin(a) * spd,
+          life, maxLife: life,
+          size: 2 + Math.random() * 6 * state.intensity,
+          hue: 10 + Math.random() * 35,
+        });
+      }
+    }
+
+    function spawnEmber(x, y, count) {
+      for (let i = 0; i < count && particles.length < MAX_PARTICLES; i++) {
+        const a = Math.random() * Math.PI * 2;
+        const spd = 10 + Math.random() * 50;
+        const life = 0.6 + Math.random() * 1.0;
+        particles.push({
+          kind: 1, x, y,
+          vx: Math.cos(a) * spd,
+          vy: Math.sin(a) * spd - 20 - Math.random() * 30,
+          life, maxLife: life,
+          size: 1 + Math.random() * 2,
+          hue: 25 + Math.random() * 20,
+        });
+      }
+    }
+
+    function spawnSmoke(x, y, count) {
+      for (let i = 0; i < count && particles.length < MAX_PARTICLES; i++) {
+        const life = 1.5 + Math.random() * 2.0;
+        particles.push({
+          kind: 2,
+          x: x + (Math.random() - 0.5) * 10, y: y - 2,
+          vx: (Math.random() - 0.5) * 8,
+          vy: -8 - Math.random() * 20,
+          life, maxLife: life,
+          size: 4 + Math.random() * 10, hue: 0,
+        });
+      }
+    }
+
+    // ── Per-element damage state ──
+    // { progress: 0..1, overlay: HTMLCanvasElement, oCtx, lastHit }
+    // The overlay canvas is positioned inside the element and scrolls with it.
+    const dmg = new Map();
+    const destroyed = new Set();
+
+    const SKIP_IDS = new Set([
+      "__html_shader_fire_canvas__",
+      "__html_shader_fire_glow__",
+    ]);
+
+    function getTargetElements() {
+      const all = document.body.querySelectorAll(
+        "h1,h2,h3,h4,h5,h6,p,a,button,img,li,span," +
+          "div,section,nav,article,header,footer,ul,ol," +
+          "input,textarea,select,label,code,pre,blockquote," +
+          "table,tr,td,th,figure,figcaption,svg",
+      );
+      const results = [];
+      for (const el of all) {
+        if (SKIP_IDS.has(el.id)) continue;
+        if (el.closest("[id^='__html_shader']")) continue;
+        if (el.classList.contains("__fb_overlay")) continue;
+        const hasChild = el.querySelector(
+          "h1,h2,h3,p,a,button,img,li,span,code,pre",
+        );
+        if (!hasChild || el.tagName === "LI" || el.tagName === "A") {
+          results.push(el);
+        }
+      }
+      return results;
+    }
+
+    // ── Create per-element burn overlay (canvas inside the element) ──
+    function ensureDmgEntry(el) {
+      if (dmg.has(el)) return dmg.get(el);
+
+      // Ensure the element can contain an overlay
+      const pos = getComputedStyle(el).position;
+      if (pos === "static") el.style.position = "relative";
+      el.style.overflow = "hidden";
+
+      const overlay = document.createElement("canvas");
+      overlay.className = "__fb_overlay";
+      Object.assign(overlay.style, {
+        position: "absolute", inset: "0",
+        width: "100%", height: "100%",
+        pointerEvents: "none",
+        zIndex: "1",
+        mixBlendMode: "multiply",
+      });
+      // Size to element
+      const rect = el.getBoundingClientRect();
+      const w = Math.max(Math.ceil(rect.width * pDpr), 1);
+      const h = Math.max(Math.ceil(rect.height * pDpr), 1);
+      overlay.width = w;
+      overlay.height = h;
+      el.appendChild(overlay);
+
+      const oCtx = overlay.getContext("2d");
+      const d = { progress: 0, overlay, oCtx, lastHit: 0, w: rect.width, h: rect.height };
+      dmg.set(el, d);
+      return d;
+    }
+
+    // ── Paint burn scar onto element's local overlay canvas ──
+    function paintElScar(d, localX, localY, r) {
+      const ctx = d.oCtx;
+      const sx = localX * pDpr;
+      const sy = localY * pDpr;
+      const sr = r * pDpr;
+
+      const n = 5 + Math.floor(Math.random() * 4);
+      for (let i = 0; i < n; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const dist = Math.random() * sr * 0.9;
+        const bx = sx + Math.cos(angle) * dist;
+        const by = sy + Math.sin(angle) * dist;
+        const br = 1 + Math.random() * sr * 0.4;
+        ctx.beginPath();
+        ctx.arc(bx, by, br, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(15, 8, 2, ${0.06 + Math.random() * 0.06})`;
+        ctx.fill();
+      }
+
+      // Glowing edge ring
+      ctx.save();
+      ctx.globalCompositeOperation = "screen";
+      const edgeR = sr * 1.1;
+      const grad = ctx.createRadialGradient(sx, sy, sr * 0.4, sx, sy, edgeR);
+      grad.addColorStop(0, "rgba(0,0,0,0)");
+      grad.addColorStop(0.6, "rgba(0,0,0,0)");
+      grad.addColorStop(0.8, `rgba(255, 120, 20, ${0.04 * state.intensity})`);
+      grad.addColorStop(1, "rgba(0,0,0,0)");
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(sx, sy, edgeR, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    // ── Main loop ──
+    let running = true;
+    let raf = 0;
+    let lastTime = performance.now();
+    let flickerSeed = 0;
+
+    function tick() {
+      if (!running) return;
+      const now = performance.now();
+      const dt = Math.min((now - lastTime) / 1000, 0.05);
+      lastTime = now;
+      flickerSeed += dt;
+
+      const cx = state.cursorX;
+      const cy = state.cursorY;
+      const radiusPx = getRadiusPx();
+      const isOnPage = cx > -999 && state.active;
+
+      // ── Emit particles on hover (viewport coords) ──
+      if (isOnPage) {
+        const dx = cx - state.prevX;
+        const dy = cy - state.prevY;
+        const moveDist = Math.sqrt(dx * dx + dy * dy);
+        const steps = Math.max(1, Math.floor(moveDist / 5));
+        const density = Math.max(1, Math.floor(state.particleDensity * 4));
+
+        for (let s = 0; s <= steps; s++) {
+          const t = steps > 0 ? s / steps : 1;
+          const px = state.prevX + dx * t;
+          const py = state.prevY + dy * t;
+          spawnFlame(px, py, density);
+          if (Math.random() < 0.3) spawnEmber(px, py, 1);
+          if (Math.random() < 0.15) spawnSmoke(px, py, 1);
+        }
+        state.prevX = cx;
+        state.prevY = cy;
+      }
+
+      // ── Draw particles (viewport-fixed canvas, clears each frame) ──
+      fCtx.save();
+      fCtx.setTransform(1, 0, 0, 1, 0, 0);
+      fCtx.clearRect(0, 0, fireCanvas.width, fireCanvas.height);
+      fCtx.restore();
+
+      for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.life -= dt;
+        if (p.life <= 0) { particles.splice(i, 1); continue; }
+        const t = p.life / p.maxLife;
+
+        if (p.kind === 0) {
+          p.vy -= 80 * dt;
+          p.vx += (Math.random() - 0.5) * 150 * dt;
+          p.x += p.vx * dt;
+          p.y += p.vy * dt;
+          const sz = p.size * (0.3 + t * 0.7);
+          const lum = 50 + (1 - t) * 35;
+          fCtx.beginPath();
+          fCtx.arc(p.x, p.y, sz, 0, Math.PI * 2);
+          fCtx.fillStyle = `hsla(${p.hue - (1 - t) * 20}, 95%, ${lum}%, ${t * 0.8})`;
+          fCtx.fill();
+        } else if (p.kind === 1) {
+          p.vy -= 25 * dt;
+          p.x += p.vx * dt;
+          p.y += p.vy * dt;
+          p.vx *= 0.98;
+          fCtx.beginPath();
+          fCtx.arc(p.x, p.y, p.size * t, 0, Math.PI * 2);
+          fCtx.fillStyle = `hsla(${p.hue}, 100%, ${55 + Math.random() * 25}%, ${t})`;
+          fCtx.fill();
+        } else {
+          p.vy -= 5 * dt;
+          p.x += p.vx * dt;
+          p.y += p.vy * dt;
+          p.size += 8 * dt;
+          fCtx.beginPath();
+          fCtx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+          fCtx.fillStyle = `rgba(35, 30, 25, ${t * 0.18})`;
+          fCtx.fill();
+        }
+      }
+
+      // ── Flickering glow at cursor (viewport-fixed, clears each frame) ──
+      gCtx.save();
+      gCtx.setTransform(1, 0, 0, 1, 0, 0);
+      gCtx.clearRect(0, 0, glowCanvas.width, glowCanvas.height);
+      gCtx.restore();
+
+      if (isOnPage) {
+        const flicker = 0.85 + Math.sin(flickerSeed * 18) * 0.08
+                       + Math.sin(flickerSeed * 31) * 0.07;
+        const glowR = radiusPx * 2.0;
+        const grad = gCtx.createRadialGradient(cx, cy, 0, cx, cy, glowR);
+        const a = state.intensity * flicker;
+        grad.addColorStop(0, `rgba(255, 180, 60, ${0.25 * a})`);
+        grad.addColorStop(0.4, `rgba(255, 100, 20, ${0.1 * a})`);
+        grad.addColorStop(1, "rgba(255, 60, 0, 0)");
+        gCtx.fillStyle = grad;
+        gCtx.fillRect(cx - glowR, cy - glowR, glowR * 2, glowR * 2);
+      }
+
+      // ── Element-bound burn damage ──
+      if (isOnPage) {
+        const elements = getTargetElements();
+        for (const el of elements) {
+          if (destroyed.has(el)) continue;
+
+          const rect = el.getBoundingClientRect();
+          // Closest point on element to cursor (viewport coords)
+          const nearX = Math.max(rect.left, Math.min(cx, rect.right));
+          const nearY = Math.max(rect.top, Math.min(cy, rect.bottom));
+          const edgeDx = cx - nearX;
+          const edgeDy = cy - nearY;
+          const edgeDist = Math.sqrt(edgeDx * edgeDx + edgeDy * edgeDy);
+
+          if (edgeDist > radiusPx) continue;
+
+          const d = ensureDmgEntry(el);
+          d.lastHit = now;
+
+          // Resize overlay if element changed size
+          if (Math.abs(rect.width - d.w) > 2 || Math.abs(rect.height - d.h) > 2) {
+            d.w = rect.width;
+            d.h = rect.height;
+            d.overlay.width = Math.max(Math.ceil(rect.width * pDpr), 1);
+            d.overlay.height = Math.max(Math.ceil(rect.height * pDpr), 1);
+          }
+
+          // Cursor position in element-local coords
+          const localX = cx - rect.left;
+          const localY = cy - rect.top;
+
+          // Paint scar on element's own overlay (scrolls with element)
+          paintElScar(d, localX, localY, radiusPx * 0.5);
+
+          const proximity = 1 - edgeDist / radiusPx;
+          d.progress = Math.min(
+            d.progress + proximity * proximity * state.burnSpeed * 1.2 * dt,
+            1,
+          );
+          const p = d.progress;
+
+          // ── Progressive CSS damage (applied to the element itself) ──
+          const brightness = 1 - p * 0.65;
+          const sepia = Math.min(p * 1.5, 1);
+          const contrast = 1 + p * 0.3;
+          const blur = p > 0.5 ? (p - 0.5) * 3 : 0;
+          const opacity = p > 0.7 ? 1 - (p - 0.7) * 3.3 : 1;
+
+          // Heat distortion — subtle oscillating warp
+          const heatAmt = Math.min(p, 0.4) * proximity;
+          const warpX = Math.sin(now * 0.012 + rect.top * 0.07) * heatAmt * 4;
+          const warpY = Math.cos(now * 0.015 + rect.left * 0.09) * heatAmt * 3;
+
+          // Flickering inset glow + char shadow
+          const fl = 0.7 + Math.sin(flickerSeed * 22 + rect.top) * 0.3;
+          const charShadow = p > 0.15
+            ? `inset 0 0 ${p * 12}px rgba(255, 90, 10, ${p * 0.25 * fl}),` +
+              ` 0 0 ${p * 6}px rgba(15, 5, 0, ${p * 0.4})`
+            : "none";
+
+          const nearFlicker = proximity > 0.3 && p < 0.7
+            ? 1 + Math.sin(flickerSeed * 15 + rect.left * 0.05) * 0.04 * state.intensity
+            : 1;
+
+          el.style.transition = "none";
+          el.style.filter =
+            `brightness(${brightness * nearFlicker}) sepia(${sepia}) contrast(${contrast}) blur(${blur}px)`;
+          el.style.opacity = String(Math.max(opacity, 0));
+          el.style.transform = `translate(${warpX}px, ${warpY}px)`;
+          el.style.boxShadow = charShadow;
+
+          // ── Destroyed ──
+          if (p >= 0.97) {
+            destroyed.add(el);
+            dmg.delete(el);
+            const elCx = rect.left + rect.width / 2;
+            const elCy = rect.top + rect.height / 2;
+            el.style.transition = "opacity 0.4s ease-out, transform 0.4s ease-out";
+            el.style.opacity = "0";
+            el.style.transform = `translate(${warpX}px, ${warpY - 5}px) scale(0.95)`;
+            spawnEmber(elCx, elCy, 12);
+            spawnSmoke(elCx, elCy, 4);
+            setTimeout(() => {
+              el.style.visibility = "hidden";
+              el.style.transform = "";
+              el.style.filter = "";
+              el.style.boxShadow = "";
+              // Remove the overlay canvas
+              if (d.overlay.parentNode) d.overlay.remove();
+            }, 400);
+          }
+        }
+      }
+
+      raf = requestAnimationFrame(tick);
+    }
+
+    return {
+      state,
+      start() {
+        running = true;
+        lastTime = performance.now();
+        tick();
+      },
+      update(nextConfig) {
+        if ("fbIntensity" in nextConfig)
+          state.intensity = clampUnit(Number(nextConfig.fbIntensity));
+        if ("fbRadius" in nextConfig)
+          state.radius = clampUnit(Number(nextConfig.fbRadius));
+        if ("fbBurnspeed" in nextConfig)
+          state.burnSpeed = clampUnit(Number(nextConfig.fbBurnspeed));
+        if ("fbParticles" in nextConfig)
+          state.particleDensity = clampUnit(Number(nextConfig.fbParticles));
+      },
+      destroy() {
+        running = false;
+        cancelAnimationFrame(raf);
+        for (const [el, d] of dmg) {
+          el.style.filter = "";
+          el.style.opacity = "";
+          el.style.transform = "";
+          el.style.boxShadow = "";
+          el.style.transition = "";
+          el.style.overflow = "";
+          if (d.overlay.parentNode) d.overlay.remove();
+        }
+        dmg.clear();
+        for (const el of destroyed) {
+          el.style.visibility = "";
+          el.style.filter = "";
+          el.style.opacity = "";
+          el.style.transform = "";
+          el.style.boxShadow = "";
+          el.style.transition = "";
+          el.style.overflow = "";
+          // Remove any lingering overlays
+          el.querySelectorAll(".__fb_overlay").forEach((c) => c.remove());
+        }
+        destroyed.clear();
+        fireCanvas.remove();
+        glowCanvas.remove();
+      },
+    };
+  }
+
   // ── Three.js black hole cursor overlay ─────────────────────────
   function createBlackholeCursor(getState) {
     const container = document.createElement("canvas");
@@ -1259,7 +1774,7 @@ void main() {
 
   if (window.__htmlShaderStop) window.__htmlShaderStop();
 
-  const engineKinds = ["fragment", "roll", "blackhole"];
+  const engineKinds = ["fragment", "roll", "blackhole", "fireburn"];
   const config =
     typeof rawConfig === "string"
       ? { engine: "fragment", fragSrc: rawConfig, rollProgress: 1 }
@@ -1273,6 +1788,10 @@ void main() {
           radius: clampUnit(Number(rawConfig?.radius ?? 0.4)),
           speed: clampUnit(Number(rawConfig?.speed ?? 0.5)),
           spin: clampUnit(Number(rawConfig?.spin ?? 0.3)),
+          fbIntensity: clampUnit(Number(rawConfig?.fbIntensity ?? 0.6)),
+          fbRadius: clampUnit(Number(rawConfig?.fbRadius ?? 0.4)),
+          fbBurnspeed: clampUnit(Number(rawConfig?.fbBurnspeed ?? 0.5)),
+          fbParticles: clampUnit(Number(rawConfig?.fbParticles ?? 0.6)),
         };
 
   // ════════════════════════════════════════════════════════════════
@@ -1316,6 +1835,55 @@ void main() {
       removeEventListener("mousemove", onMouse);
       engine.destroy();
       bhCursor.destroy();
+      cursorStyle.remove();
+      delete window.__htmlShaderStop;
+      delete window.__htmlShaderUpdate;
+    };
+
+    window.__htmlShaderStop = stop;
+    window.__htmlShaderUpdate = (nextConfig) => {
+      if (!nextConfig) return;
+      engine.update(nextConfig);
+    };
+    return null;
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  // FIRE BURN — DOM-based engine (no WebGL, no drawElement)
+  // ════════════════════════════════════════════════════════════════
+  if (config.engine === "fireburn") {
+    const engine = createFireBurnEngine(config);
+
+    // Custom cursor
+    const cursorStyle = document.createElement("style");
+    cursorStyle.id = "__html_shader_fb_style__";
+    cursorStyle.textContent = "* { cursor: none !important; }";
+    document.head.appendChild(cursorStyle);
+
+    // Hover-driven — no click required
+    const onMouseMove = (e) => {
+      if (!engine.state.active) {
+        engine.state.active = true;
+        engine.state.prevX = e.clientX;
+        engine.state.prevY = e.clientY;
+      }
+      engine.state.cursorX = e.clientX;
+      engine.state.cursorY = e.clientY;
+    };
+    const onMouseLeave = () => {
+      engine.state.active = false;
+      engine.state.cursorX = -9999;
+      engine.state.cursorY = -9999;
+    };
+    addEventListener("mousemove", onMouseMove);
+    document.documentElement.addEventListener("mouseleave", onMouseLeave);
+
+    engine.start();
+
+    const stop = () => {
+      removeEventListener("mousemove", onMouseMove);
+      document.documentElement.removeEventListener("mouseleave", onMouseLeave);
+      engine.destroy();
       cursorStyle.remove();
       delete window.__htmlShaderStop;
       delete window.__htmlShaderUpdate;
