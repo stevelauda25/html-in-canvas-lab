@@ -207,6 +207,17 @@ void main() {
 // displaced (no spring-back). Tornado cursor, lightning flashes,
 // wind streaks, debris particles, vignette darkening.`,
   },
+  fighting: {
+    kind: "fighting",
+    hint: "Click Apply, then click a DOM element to fight it. Controls: <code>A/D</code> move, <code>Space</code> jump, <code>Click</code> attack.",
+    controls: [
+      { key: "ftDifficulty", label: "Difficulty", min: 0.1, max: 1, default: 0.4 },
+    ],
+    source: `// Built-in UI Fighter preset.
+// Select a DOM element as opponent. Fight it in a retro arena.
+// A/D = move, Space = jump, Click = attack.
+// Both sides have 100 HP. Reduce enemy HP to 0 to win.`,
+  },
 };
 
 const DEFAULT_PRESET = "blur";
@@ -3280,6 +3291,654 @@ void main() {
     };
   }
 
+  // ── UI Fighter engine ──────────────────────────────────────────
+  // State machine: intro → select → countdown → fight → end.
+  // Selection uses DOM hover highlights. Enemy is a cloneNode of the
+  // selected element, rendered as actual DOM inside the arena.
+  // ESC returns to selection for replay.
+  function createFightingEngine(config) {
+    const difficulty = clampUnit(Number(config.ftDifficulty ?? 0.4));
+    const W = innerWidth;
+    const H = innerHeight;
+    const GROUND_Y = H - 100;
+    const GRAVITY = 1200;
+    const MOVE_SPEED = 250;
+    const JUMP_VEL = -500;
+    const ATTACK_RANGE = 70;
+    const ATTACK_DMG = 8 + Math.floor(difficulty * 7);
+
+    let phase = "intro"; // intro | select | countdown | fight | end
+    let running = true;
+    let raf = 0;
+    let lastTime = performance.now();
+    let phaseTimer = 0;
+    let countdownVal = 3;
+    let endMessage = "";
+    let player = null;
+    let enemy = null;
+    let enemyClone = null; // actual DOM clone
+
+    // ── Arena container (DOM-based, covers full screen) ──
+    const arena = document.createElement("div");
+    arena.id = "__html_shader_fight_arena__";
+    Object.assign(arena.style, {
+      position: "fixed", inset: "0", width: "100vw", height: "100vh",
+      zIndex: "2147483647", overflow: "hidden",
+      fontFamily: "monospace",
+    });
+    document.body.appendChild(arena);
+
+    // Arena canvas for background + player + HUD
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.floor(W * dpr);
+    canvas.height = Math.floor(H * dpr);
+    Object.assign(canvas.style, {
+      position: "absolute", inset: "0", width: "100%", height: "100%",
+      pointerEvents: "none",
+    });
+    arena.appendChild(canvas);
+    const ctx = canvas.getContext("2d");
+    ctx.scale(dpr, dpr);
+
+    // ── Top bar (for select text) ──
+    const topBar = document.createElement("div");
+    Object.assign(topBar.style, {
+      position: "absolute", top: "0", left: "0", right: "0",
+      padding: "14px 0", textAlign: "center",
+      background: "rgba(0,0,0,0.85)", color: "#fff",
+      fontSize: "18px", fontWeight: "bold", letterSpacing: "2px",
+      fontFamily: "monospace", zIndex: "5",
+      display: "none",
+    });
+    topBar.textContent = "SELECT YOUR OPPONENT";
+    arena.appendChild(topBar);
+
+    // ── Highlight style for hovered elements ──
+    const highlightStyle = document.createElement("style");
+    highlightStyle.id = "__html_shader_fight_hl__";
+    highlightStyle.textContent = "";
+    document.head.appendChild(highlightStyle);
+
+    // ── Damage floats + hit effects ──
+    const floats = []; // { x, y, text, color, life, maxLife }
+    const impacts = []; // { x, y, life }
+
+    function spawnFloat(x, y, text, color) {
+      floats.push({ x, y, text, color, life: 0.8, maxLife: 0.8 });
+    }
+    function spawnImpact(x, y) {
+      impacts.push({ x, y, life: 0.2 });
+    }
+
+    // ── Control legend (DOM, bottom HUD) ──
+    const legend = document.createElement("div");
+    Object.assign(legend.style, {
+      position: "absolute", bottom: "0", left: "0", right: "0",
+      display: "flex", justifyContent: "center", gap: "18px",
+      paddingTop: "32px", paddingBottom: "12px",
+      background: "linear-gradient(transparent, rgba(0,0,0,0.7))",
+      fontFamily: "monospace", fontSize: "11px", color: "#aaa",
+      zIndex: "6", pointerEvents: "none",
+      visibility: "hidden",
+    });
+    const controls = [
+      ["A", "Move Left"], ["D", "Move Right"],
+      ["Space", "Jump"], ["Click", "Attack"], ["ESC", "Exit"],
+    ];
+    for (const [key, label] of controls) {
+      const item = document.createElement("span");
+      item.innerHTML =
+        `<span style="background:#333;color:#fff;padding:2px 6px;border-radius:3px;margin-right:4px;font-size:10px;">${key}</span>${label}`;
+      legend.appendChild(item);
+    }
+    arena.appendChild(legend);
+
+    // ── ESC confirmation modal ──
+    const modal = document.createElement("div");
+    Object.assign(modal.style, {
+      position: "absolute", inset: "0",
+      display: "none", alignItems: "center", justifyContent: "center",
+      background: "rgba(0,0,0,0.6)",
+      zIndex: "10", fontFamily: "monospace",
+    });
+    modal.innerHTML = `
+      <div style="background:#1a1a2a;border:1px solid #444;border-radius:8px;padding:30px 40px;text-align:center;">
+        <div style="color:#fff;font-size:16px;font-weight:bold;margin-bottom:20px;">ARE YOU SURE YOU WANT TO QUIT?</div>
+        <div style="display:flex;gap:16px;justify-content:center;">
+          <button id="__fight_quit_yes" style="background:#c44;color:#fff;border:none;padding:8px 24px;border-radius:4px;cursor:pointer;font-family:monospace;font-size:13px;">YES</button>
+          <button id="__fight_quit_no" style="background:#444;color:#fff;border:none;padding:8px 24px;border-radius:4px;cursor:pointer;font-family:monospace;font-size:13px;">NO</button>
+        </div>
+      </div>`;
+    arena.appendChild(modal);
+    let paused = false;
+
+    modal.querySelector("#__fight_quit_yes").addEventListener("click", (e) => {
+      e.stopPropagation();
+      modal.style.display = "none";
+      paused = false;
+      enterEnd("YOU LOSE!");
+    });
+    modal.querySelector("#__fight_quit_no").addEventListener("click", (e) => {
+      e.stopPropagation();
+      modal.style.display = "none";
+      paused = false;
+    });
+
+    let hoveredEl = null;
+    let hoverHandler = null;
+
+    // ── Unified input ──
+    const keys = { a: false, d: false, space: false };
+    let attackQueued = false;
+
+    function onKeyDown(e) {
+      if (e.key === "a" || e.key === "A") keys.a = true;
+      if (e.key === "d" || e.key === "D") keys.d = true;
+      if (e.key === " ") { keys.space = true; e.preventDefault(); }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        if (phase === "fight" && !paused) {
+          paused = true;
+          modal.style.display = "flex";
+        } else if (phase === "end" || phase === "countdown") {
+          cleanupFight();
+          enterSelect();
+        }
+      }
+    }
+    function onKeyUp(e) {
+      if (e.key === "a" || e.key === "A") keys.a = false;
+      if (e.key === "d" || e.key === "D") keys.d = false;
+      if (e.key === " ") keys.space = false;
+    }
+
+    // ── Single click handler — behavior depends on phase ──
+    function onGlobalClick(e) {
+      // SELECT: click picks an opponent
+      if (phase === "select") {
+        const el = e.target;
+        if (el.closest("[id^='__html_shader']")) return;
+        e.preventDefault();
+        e.stopPropagation();
+        selectOpponent(el);
+        return;
+      }
+      // FIGHT: click triggers attack
+      if (phase === "fight") {
+        attackQueued = true;
+        return;
+      }
+      // COUNTDOWN / END / INTRO: ignore clicks
+    }
+
+    addEventListener("keydown", onKeyDown);
+    addEventListener("keyup", onKeyUp);
+    document.addEventListener("click", onGlobalClick, true);
+
+    // ── Intro phase ──
+    function enterIntro() {
+      phase = "intro";
+      phaseTimer = 0;
+      arena.style.background = "rgba(0,0,0,0.4)";
+      arena.style.pointerEvents = "none";
+      canvas.style.display = "none";
+      topBar.style.display = "none";
+    }
+
+    // ── Select phase ──
+    function enterSelect() {
+      phase = "select";
+      phaseTimer = 0;
+      arena.style.background = "transparent";
+      arena.style.pointerEvents = "none";
+      canvas.style.display = "none";
+      topBar.style.display = "";
+
+      // Hover highlight
+      highlightStyle.textContent =
+        ".__fight_hover { outline: 3px solid #4af !important; outline-offset: 2px; cursor: crosshair !important; }";
+
+      hoverHandler = (e) => {
+        if (phase !== "select") return;
+        const el = e.target;
+        if (el.closest("[id^='__html_shader']")) return;
+        if (hoveredEl) hoveredEl.classList.remove("__fight_hover");
+        hoveredEl = el;
+        el.classList.add("__fight_hover");
+      };
+
+      document.addEventListener("mouseover", hoverHandler, true);
+    }
+
+    function cleanupSelect() {
+      if (hoveredEl) hoveredEl.classList.remove("__fight_hover");
+      hoveredEl = null;
+      highlightStyle.textContent = "";
+      if (hoverHandler) document.removeEventListener("mouseover", hoverHandler, true);
+      hoverHandler = null;
+    }
+
+    // ── Opponent selected ──
+    function selectOpponent(el) {
+      cleanupSelect();
+      topBar.style.display = "none";
+
+      // Clone the DOM element
+      enemyClone = el.cloneNode(true);
+      enemyClone.classList.remove("__fight_hover");
+      Object.assign(enemyClone.style, {
+        position: "absolute",
+        pointerEvents: "none",
+        maxWidth: "200px",
+        maxHeight: "120px",
+        overflow: "hidden",
+        zIndex: "3",
+        transition: "none",
+        boxShadow: "0 0 20px rgba(255,60,60,0.3)",
+        border: "2px solid rgba(255,80,80,0.4)",
+      });
+      arena.appendChild(enemyClone);
+
+      // Get enemy name
+      let eName = el.tagName.toLowerCase();
+      const txt = el.textContent.trim();
+      if (txt.length > 0 && txt.length < 20) eName = txt.slice(0, 15);
+
+      // Fighter data
+      const cloneRect = { w: Math.min(el.offsetWidth, 200), h: Math.min(el.offsetHeight, 120) };
+      player = {
+        x: W * 0.25, y: GROUND_Y, w: 50, h: 70,
+        vx: 0, vy: 0, hp: 100, maxHp: 100,
+        grounded: true, attacking: false,
+        attackTimer: 0, attackCooldown: 0, hitTimer: 0, facing: 1,
+        name: "Player", color: "#4af",
+      };
+      enemy = {
+        x: W * 0.72, y: GROUND_Y,
+        w: cloneRect.w, h: cloneRect.h,
+        vx: 0, vy: 0, hp: 100, maxHp: 100,
+        grounded: true, attacking: false,
+        attackTimer: 0, attackCooldown: 0, hitTimer: 0, facing: -1,
+        name: eName, color: "#e44",
+        aiTimer: 0, aiAction: "idle",
+      };
+
+      enterCountdown();
+    }
+
+    // ── Countdown ──
+    function enterCountdown() {
+      phase = "countdown";
+      countdownVal = 3;
+      phaseTimer = 0;
+      arena.style.background = "";
+      arena.style.pointerEvents = "auto";
+      canvas.style.display = "";
+    }
+
+    function enterFight() {
+      phase = "fight";
+      attackQueued = false;
+    }
+
+    function enterEnd(msg) {
+      phase = "end";
+      endMessage = msg;
+      phaseTimer = 0;
+    }
+
+    function cleanupFight() {
+      if (enemyClone && enemyClone.parentNode) enemyClone.remove();
+      enemyClone = null;
+      player = null;
+      enemy = null;
+      keys.a = false; keys.d = false; keys.space = false;
+      attackQueued = false;
+    }
+
+    // ── AI ──
+    function updateAI(dt) {
+      if (!enemy) return;
+      enemy.aiTimer -= dt;
+      if (enemy.aiTimer <= 0) {
+        const r = Math.random();
+        const ag = 0.3 + difficulty * 0.5;
+        if (r < ag * 0.4) enemy.aiAction = "attack";
+        else if (r < ag * 0.7) enemy.aiAction = "approach";
+        else if (r < 0.85) enemy.aiAction = "retreat";
+        else enemy.aiAction = "jump";
+        enemy.aiTimer = 0.3 + Math.random() * 0.5;
+      }
+
+      const dx = player.x - enemy.x;
+      const dist = Math.abs(dx);
+      enemy.facing = dx > 0 ? 1 : -1;
+
+      if (enemy.aiAction === "approach") {
+        enemy.vx = enemy.facing * MOVE_SPEED * (0.4 + difficulty * 0.4);
+      } else if (enemy.aiAction === "retreat") {
+        enemy.vx = -enemy.facing * MOVE_SPEED * 0.35;
+      } else if (enemy.aiAction === "attack" && dist < ATTACK_RANGE * 1.8) {
+        if (enemy.attackCooldown <= 0) {
+          enemy.attacking = true;
+          enemy.attackTimer = 0.15;
+          enemy.attackCooldown = 0.4 + (1 - difficulty) * 0.3;
+        }
+        enemy.vx *= 0.5;
+      } else if (enemy.aiAction === "jump" && enemy.grounded) {
+        enemy.vy = JUMP_VEL * 0.7;
+        enemy.grounded = false;
+      } else {
+        enemy.vx *= 0.8;
+      }
+    }
+
+    // ── Physics ──
+    function updateFighter(f, dt) {
+      if (!f.grounded) f.vy += GRAVITY * dt;
+      f.x += f.vx * dt;
+      f.y += f.vy * dt;
+      if (f.y >= GROUND_Y) { f.y = GROUND_Y; f.vy = 0; f.grounded = true; }
+      f.x = Math.max(f.w / 2, Math.min(W - f.w / 2, f.x));
+      if (f.attackTimer > 0) { f.attackTimer -= dt; if (f.attackTimer <= 0) f.attacking = false; }
+      if (f.attackCooldown > 0) f.attackCooldown -= dt;
+      if (f.hitTimer > 0) f.hitTimer -= dt;
+    }
+
+    function checkAttack(a, d) {
+      if (!a.attacking || a.attackTimer < 0.1) return;
+      const ax = a.x + a.facing * 35;
+      if (Math.abs(ax - d.x) < ATTACK_RANGE && Math.abs(a.y - d.y) < 80) {
+        const dmg = ATTACK_DMG + Math.floor(Math.random() * 5);
+        d.hp = Math.max(0, d.hp - dmg);
+        d.hitTimer = 0.2;
+        d.vx += a.facing * 150;
+        a.attackTimer = 0;
+        // Damage float + impact burst
+        const hitX = d.x + (Math.random() - 0.5) * 20;
+        const hitY = d.y - d.h * 0.6;
+        spawnFloat(hitX, hitY, (a === player ? "+" : "-") + dmg, a === player ? "#fff" : "#f55");
+        spawnImpact(hitX, hitY);
+      }
+    }
+
+    // ── Draw ──
+    function drawArena() {
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.restore();
+
+      // Background
+      const grad = ctx.createLinearGradient(0, 0, 0, H);
+      grad.addColorStop(0, "#0a0a1a");
+      grad.addColorStop(1, "#1a1020");
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, W, H);
+
+      // Ground
+      ctx.fillStyle = "#1a1a22";
+      ctx.fillRect(0, GROUND_Y, W, H - GROUND_Y);
+      ctx.strokeStyle = "#333";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(0, GROUND_Y);
+      ctx.lineTo(W, GROUND_Y);
+      ctx.stroke();
+    }
+
+    function drawPlayer() {
+      if (!player) return;
+      ctx.save();
+      const sx = player.hitTimer > 0 ? (Math.random() - 0.5) * 6 : 0;
+      const sy = player.hitTimer > 0 ? (Math.random() - 0.5) * 4 : 0;
+      ctx.translate(player.x + sx, player.y + sy);
+
+      const c = player.hitTimer > 0 ? "#fff" : player.color;
+      ctx.fillStyle = c;
+      ctx.fillRect(-player.w / 2, -player.h, player.w, player.h);
+      const ex = player.facing > 0 ? 8 : -18;
+      ctx.fillStyle = "#111";
+      ctx.fillRect(ex, -player.h + 15, 6, 6);
+      ctx.fillRect(ex + 12, -player.h + 15, 6, 6);
+      ctx.fillRect(ex + 2, -player.h + 28, 14, 3);
+
+      if (player.attacking) {
+        ctx.fillStyle = c;
+        ctx.fillRect(player.facing * 25, -player.h + 25, player.facing * 30, 10);
+        ctx.fillStyle = "#ff0";
+        ctx.fillRect(player.facing * 50, -player.h + 22, 12, 16);
+      }
+      ctx.restore();
+    }
+
+    function positionEnemyClone() {
+      if (!enemy || !enemyClone) return;
+      const sx = enemy.hitTimer > 0 ? (Math.random() - 0.5) * 8 : 0;
+      const sy = enemy.hitTimer > 0 ? (Math.random() - 0.5) * 6 : 0;
+      enemyClone.style.left = (enemy.x - enemy.w / 2 + sx) + "px";
+      enemyClone.style.top = (enemy.y - enemy.h + sy) + "px";
+      enemyClone.style.opacity = enemy.hitTimer > 0 ? "0.6" : "1";
+      enemyClone.style.filter = enemy.hp < 30 ? "sepia(0.5) brightness(0.7)" : "";
+    }
+
+    function drawHUD() {
+      if (!player || !enemy) return;
+      const barW = Math.min(220, W * 0.22);
+      const barH = 16;
+      const barY = 18;
+
+      for (const [f, bx, align] of [[player, 20, "left"], [enemy, W - 20, "right"]]) {
+        const x = align === "left" ? bx : bx - barW;
+        const pct = f.hp / f.maxHp;
+        ctx.fillStyle = "#222";
+        ctx.fillRect(x, barY, barW, barH);
+        ctx.fillStyle = pct > 0.5 ? "#4c4" : pct > 0.25 ? "#cc4" : "#c44";
+        ctx.fillRect(x, barY, barW * pct, barH);
+        ctx.strokeStyle = "#666";
+        ctx.lineWidth = 1;
+        ctx.strokeRect(x, barY, barW, barH);
+        // Name
+        ctx.fillStyle = "#ddd";
+        ctx.font = "bold 11px monospace";
+        ctx.textAlign = align;
+        ctx.fillText(
+          f.name.toUpperCase(),
+          align === "left" ? x : x + barW,
+          barY - 4,
+        );
+        // HP percentage inside bar
+        ctx.fillStyle = "#fff";
+        ctx.font = "bold 10px monospace";
+        ctx.textAlign = "center";
+        ctx.fillText(
+          Math.round(pct * 100) + "%",
+          x + barW / 2,
+          barY + barH - 4,
+        );
+      }
+      ctx.fillStyle = "#555";
+      ctx.font = "12px monospace";
+      ctx.textAlign = "center";
+      ctx.fillText("VS", W / 2, barY + 12);
+    }
+
+    // ── Main loop ──
+    function tick() {
+      if (!running) return;
+      const now = performance.now();
+      const dt = Math.min((now - lastTime) / 1000, 0.05);
+      lastTime = now;
+      phaseTimer += dt;
+
+      // ── INTRO ──
+      if (phase === "intro") {
+        // Dark flash with centered text
+        ctx.save();
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.restore();
+        canvas.style.display = "";
+        ctx.fillStyle = `rgba(0,0,0,${Math.min(phaseTimer * 2, 0.4)})`;
+        ctx.fillRect(0, 0, W, H);
+        ctx.fillStyle = "#fff";
+        ctx.font = "bold 32px monospace";
+        ctx.textAlign = "center";
+        ctx.fillText("SELECT YOUR OPPONENT", W / 2, H / 2);
+        ctx.font = "14px monospace";
+        ctx.fillStyle = "#888";
+        ctx.fillText("Click any element on the page", W / 2, H / 2 + 30);
+
+        if (phaseTimer > 1.2) {
+          enterSelect();
+        }
+        raf = requestAnimationFrame(tick);
+        return;
+      }
+
+      // ── SELECT ──
+      if (phase === "select") {
+        // No canvas drawing — page is visible, top bar shows
+        raf = requestAnimationFrame(tick);
+        return;
+      }
+
+      // ── COUNTDOWN ──
+      if (phase === "countdown") {
+        if (phaseTimer >= 1) { phaseTimer = 0; countdownVal--; }
+        if (countdownVal <= 0 && phaseTimer >= 0.5) enterFight();
+
+        drawArena();
+        drawPlayer();
+        positionEnemyClone();
+        drawHUD();
+
+        ctx.fillStyle = "#fff";
+        ctx.font = "bold 72px monospace";
+        ctx.textAlign = "center";
+        const label = countdownVal > 0 ? String(countdownVal) : "FIGHT!";
+        const scale = 1 + Math.max(0, 0.3 - phaseTimer) * 2;
+        ctx.save();
+        ctx.translate(W / 2, H / 2);
+        ctx.scale(scale, scale);
+        ctx.fillText(label, 0, 0);
+        ctx.restore();
+
+        raf = requestAnimationFrame(tick);
+        return;
+      }
+
+      // ── FIGHT ──
+      if (phase === "fight" && !paused) {
+        player.vx = 0;
+        if (keys.a) player.vx = -MOVE_SPEED;
+        if (keys.d) player.vx = MOVE_SPEED;
+        if (keys.space && player.grounded) { player.vy = JUMP_VEL; player.grounded = false; }
+        if (attackQueued && player.attackCooldown <= 0) {
+          player.attacking = true;
+          player.attackTimer = 0.15;
+          player.attackCooldown = 0.25;
+        }
+        attackQueued = false;
+        player.facing = enemy.x > player.x ? 1 : -1;
+
+        updateAI(dt);
+        updateFighter(player, dt);
+        updateFighter(enemy, dt);
+        checkAttack(player, enemy);
+        checkAttack(enemy, player);
+
+        if (enemy.hp <= 0) enterEnd("YOU WIN!");
+        if (player.hp <= 0) enterEnd("YOU LOSE!");
+      }
+
+      // Draw (fight + end)
+      drawArena();
+      drawPlayer();
+      positionEnemyClone();
+      drawHUD();
+
+      // ── Damage floats ──
+      for (let i = floats.length - 1; i >= 0; i--) {
+        const f = floats[i];
+        f.life -= dt;
+        if (f.life <= 0) { floats.splice(i, 1); continue; }
+        const t = f.life / f.maxLife;
+        f.y -= 40 * dt;
+        ctx.font = "bold 16px monospace";
+        ctx.textAlign = "center";
+        ctx.fillStyle = f.color.replace(")", `, ${t})`).replace("rgb", "rgba").replace("#", "");
+        // Handle hex colors
+        const alpha = t;
+        ctx.globalAlpha = alpha;
+        ctx.fillText(f.text, f.x, f.y);
+        ctx.globalAlpha = 1;
+      }
+
+      // ── Impact bursts ──
+      for (let i = impacts.length - 1; i >= 0; i--) {
+        const imp = impacts[i];
+        imp.life -= dt;
+        if (imp.life <= 0) { impacts.splice(i, 1); continue; }
+        const t = imp.life / 0.2;
+        const r = 15 * (1 - t) + 5;
+        ctx.beginPath();
+        ctx.arc(imp.x, imp.y, r, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(255, 255, 200, ${t * 0.5})`;
+        ctx.fill();
+        // Rays
+        for (let j = 0; j < 6; j++) {
+          const a = (j / 6) * Math.PI * 2 + t * 2;
+          const rx = imp.x + Math.cos(a) * r * 1.5;
+          const ry = imp.y + Math.sin(a) * r * 1.5;
+          ctx.beginPath();
+          ctx.moveTo(imp.x, imp.y);
+          ctx.lineTo(rx, ry);
+          ctx.strokeStyle = `rgba(255, 220, 100, ${t * 0.4})`;
+          ctx.lineWidth = 1.5;
+          ctx.stroke();
+        }
+      }
+
+      // ── Control legend visibility ──
+      legend.style.visibility = (phase === "fight" || phase === "countdown") ? "visible" : "hidden";
+
+      if (phase === "end") {
+        ctx.fillStyle = `rgba(0,0,0,${Math.min(phaseTimer * 0.5, 0.55)})`;
+        ctx.fillRect(0, 0, W, H);
+        ctx.fillStyle = endMessage.includes("WIN") ? "#4f4" : "#f44";
+        ctx.font = "bold 56px monospace";
+        ctx.textAlign = "center";
+        ctx.fillText(endMessage, W / 2, H / 2 - 10);
+        if (phaseTimer > 1) {
+          ctx.font = "14px monospace";
+          ctx.fillStyle = "#aaa";
+          ctx.fillText("Press ESC to select a new opponent", W / 2, H / 2 + 35);
+        }
+      }
+
+      raf = requestAnimationFrame(tick);
+    }
+
+    return {
+      state: { difficulty },
+      start() { running = true; lastTime = performance.now(); enterIntro(); tick(); },
+      update() {},
+      destroy() {
+        running = false;
+        cancelAnimationFrame(raf);
+        removeEventListener("keydown", onKeyDown);
+        removeEventListener("keyup", onKeyUp);
+        document.removeEventListener("click", onGlobalClick, true);
+        cleanupSelect();
+        cleanupFight();
+        highlightStyle.remove();
+        arena.remove();
+      },
+    };
+  }
+
   // ── Three.js horseshoe magnet cursor ──────────────────────────
   function createMagnetCursor() {
     const container = document.createElement("canvas");
@@ -3573,7 +4232,7 @@ void main() {
 
   if (window.__htmlShaderStop) window.__htmlShaderStop();
 
-  const engineKinds = ["fragment", "roll", "blackhole", "fireburn", "magnetic", "seedgrowth", "liquid", "storm"];
+  const engineKinds = ["fragment", "roll", "blackhole", "fireburn", "magnetic", "seedgrowth", "liquid", "storm", "fighting"];
   const config =
     typeof rawConfig === "string"
       ? { engine: "fragment", fragSrc: rawConfig, rollProgress: 1 }
@@ -3605,6 +4264,7 @@ void main() {
           stWind: clampUnit(Number(rawConfig?.stWind ?? 0.5)),
           stRadius: clampUnit(Number(rawConfig?.stRadius ?? 0.5)),
           stChaos: clampUnit(Number(rawConfig?.stChaos ?? 0.4)),
+          ftDifficulty: clampUnit(Number(rawConfig?.ftDifficulty ?? 0.4)),
         };
 
   // ════════════════════════════════════════════════════════════════
@@ -3933,6 +4593,24 @@ void main() {
       if (!nextConfig) return;
       engine.update(nextConfig);
     };
+    return null;
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  // UI FIGHTER — canvas-based game overlay
+  // ════════════════════════════════════════════════════════════════
+  if (config.engine === "fighting") {
+    const engine = createFightingEngine(config);
+    engine.start();
+
+    const stop = () => {
+      engine.destroy();
+      delete window.__htmlShaderStop;
+      delete window.__htmlShaderUpdate;
+    };
+
+    window.__htmlShaderStop = stop;
+    window.__htmlShaderUpdate = () => {};
     return null;
   }
 
