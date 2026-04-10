@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mv html-in-canvas-lab/.gitignore .)",
+      "Bash(mv html-in-canvas-lab/index.html .)",
+      "Bash(mv html-in-canvas-lab/package.json .)",
+      "Bash(mv html-in-canvas-lab/package-lock.json .)",
+      "Bash(mv html-in-canvas-lab/tsconfig.json .)",
+      "Bash(cp -r html-in-canvas-lab/src .)",
+      "Bash(cp -r html-in-canvas-lab/public .)",
+      "Bash(cp -r html-in-canvas-lab/node_modules .)",
+      "Bash(npm install:*)"
+    ],
+    "additionalDirectories": [
+      "d:\\Blissful\\Design Engineering\\html-in-canvas-lab\\html-in-canvas-lab"
+    ]
+  }
+}
